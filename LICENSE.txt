@@ -1,0 +1,23 @@
+One Identity Permissive Software License
+Version 1.0
+
+Copyright 2026 One Identity LLC.
+All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to use, copy, modify, and distribute the Software solely for lawful purposes, provided that the following conditions are met:
+
+1. The Software may not be combined, linked, distributed, or otherwise used with any software or component governed by a “copyleft” or “strong copyleft” license (including, without limitation, the GNU General Public License (GPL), Lesser GPL (LGPL), or Affero GPL (AGPL)) where such combination would require the Software or any derivative work to be disclosed, licensed, or distributed in source code form or under terms other than this License.
+
+2. The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+3. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+4. Redistributions in binary form must reproduce the above copyright notice, this list of conditions, and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+5. Neither the name of One Identity LLC nor the names of its contributors may be used to endorse or promote products derived from this Software without specific prior written permission.
+
+NO WARRANTY; LIMITATION OF LIABILITY.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL ONE IDENTITY LLC OR ITS AFFILIATES BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Any use of the Software in violation of this License is outside the scope of the rights granted herein.
