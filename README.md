@@ -10,15 +10,22 @@ A PowerShell script that connects to a One Identity Active Roles installation, c
 
 - Active Roles version and build
 - Operating system information
-- Managed domains (with optional managed user counts)
-- Replication partners (Publisher / Subscribers)
-- Dynamic Groups (with optional broken-rules check)
+- Managed domains (with optional managed user counts, including a stacked **Enabled vs Disabled** breakdown per domain)
+- Replication partners (Publisher / Subscribers) — Configuration DB and Management History DB
+- Dynamic Groups
+  - Optional broken-rules check
+  - **Distribution across Active Roles servers**, with a warning when groups are not evenly balanced
+  - **Top 10 expensive LDAP queries** (by `accountNameHistory` length), flagging any group with `>= 1000` cached entries as *Expensive*
 - Managed Units (with optional broken-rules check)
 - Workflows
 - Virtual Attributes
-- Script Modules and Policy Objects
-- Access Templates
-- SQL Server Auto Shrink status on the AR Configuration database
+- Script Modules and Policy Objects (including orphan policy links)
+- Access Templates (including orphan AT links)
+- Microsoft Entra (Azure AD) tenants configured in Active Roles
+- Microsoft Exchange presence and `PerformanceFlag` / `Disable500VA` registry checks
+- SQL Server **Auto Shrink** status on the AR Configuration database
+- SQL Server **AlwaysOn / MultiSubnetFailoverSupport** check
+- SQL Server **Parallelism Settings** check — Cost Threshold for Parallelism and MaxDOP compared against One Identity recommendations ([KB 4383609](https://support.oneidentity.com/kb/4383609))
 
 The output is a single self-contained `.html` file with KPI cards, charts, and searchable/sortable tables. Chart.js is loaded from CDN.
 
@@ -32,7 +39,7 @@ The output is a single self-contained `.html` file with KPI cards, charts, and s
 | Active Roles Management Shell | Must be installed on the AR server. |
 | Windows PowerShell 5.1 | The script targets Windows PowerShell 5.1 (the version shipped with Windows Server). |
 | Network access | Outbound HTTPS to `cdn.jsdelivr.net` is needed only on the host **viewing** the HTML, to load Chart.js. The script itself does not need internet. |
-| SQL read access | Read access to the AR Configuration database (for the Auto Shrink check). |
+| SQL read access | Read access to the AR Configuration database (for the Auto Shrink, AlwaysOn, and Parallelism checks). |
 
 ---
 
@@ -48,7 +55,7 @@ Open PowerShell with **Run as administrator**. Elevation is required for:
 
 ### 2. Run under the Active Roles service account
 
-The script connects to the Active Roles Configuration database (SQL Server) to verify the **Auto Shrink** setting. By default this connection uses **Windows Authentication (Integrated Security)**, which means the user running the script must have read access to `sys.databases` on that SQL Server.
+The script connects to the Active Roles Configuration database (SQL Server) to verify **Auto Shrink**, **AlwaysOn / MultiSubnetFailoverSupport**, and **Parallelism settings** (Cost Threshold and MaxDOP). By default this connection uses **Windows Authentication (Integrated Security)**, which means the user running the script must have read access to `sys.databases` and `sys.configurations` on that SQL Server.
 
 The Active Roles **service account** already has the required SQL permissions, so the simplest and recommended way to run the script is **as that service account**.
 
@@ -100,7 +107,7 @@ whoami
 | `-OutputPath` | `string` | Full path for the HTML report. Defaults to `.\AR_Assessment_<yyyyMMdd_HHmmss>.html`. |
 | `-SkipBrokenRulesCheck` | `switch` | Skip GUID validation for Dynamic Groups and Managed Units membership rules. Recommended for large environments. |
 | `-SkipUserCounts` | `switch` | Skip the managed user count per domain. Recommended for environments with many users. |
-| `-SqlCredential` | `PSCredential` | SQL Server credential used by the Auto Shrink check when the AR Configuration database uses SQL Authentication. If omitted, Windows Authentication is used. |
+| `-SqlCredential` | `PSCredential` | SQL Server credential used by the Auto Shrink, AlwaysOn, and Parallelism checks when the AR Configuration database uses SQL Authentication. If omitted, Windows Authentication is used. |
 
 ---
 
@@ -147,7 +154,10 @@ Use this only if the AR Configuration database is configured for SQL Server Auth
 |---|---|---|
 | `Failed to load Active Roles Management Shell` | Module not installed on this host | Install the Active Roles Management Shell, or run on the AR server. |
 | `Failed to connect to Active Roles Service` | AR service stopped or unreachable | Check the service: `Get-ARServiceStatus`. |
-| Auto Shrink check returns `Access denied` or `Login failed` | The current user is not the AR service account and has no SQL access | Re-run under the AR service account, or use `-SqlCredential`. |
+| SQL checks (Auto Shrink / AlwaysOn / Parallelism) return `Access denied` or `Login failed` | The current user is not the AR service account and has no SQL access | Re-run under the AR service account, or use `-SqlCredential`. |
+| Parallelism section shows `Action Required` | `Cost Threshold for Parallelism` is below 50 or `MaxDOP` is not 4 | Engage your DBA and review against [KB 4383609](https://support.oneidentity.com/kb/4383609). |
+| Dynamic Groups distribution warning is shown | Groups are concentrated on a single AR server in a multi-server environment | Verify whether this is intentional (dedicated Dynamic Group server). If not, rebalance Dynamic Group ownership. |
+| Many Dynamic Groups flagged as `Expensive` | Membership queries return very large result sets (`accountNameHistory >= 1000`) | Review the group membership rules; narrow scope or filters where possible to reduce AR and DC load. |
 | Script appears to hang | Broken-rules check iterating over many Dynamic Groups / Managed Units | Re-run with `-SkipBrokenRulesCheck`. |
 | Charts are blank in the HTML | Host viewing the report has no internet access to the Chart.js CDN | Open the report on a machine with outbound internet. |
 | Version shows `Unknown` | Script is not running on the AR server, or not running elevated | Run on the AR server as Administrator. |

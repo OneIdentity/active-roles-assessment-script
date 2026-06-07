@@ -76,7 +76,7 @@ Software License set forth in the LICENSE.txt file accompanying this software.
 .NOTES
     Requires  : Active Roles Management Shell
     Run on    : Active Roles Server (for registry-based version detection)
-    Version   : 1.0
+    Version   : 1.1
     Author    : One Identity IDAM3 Team
 
     Auto Shrink Check:
@@ -88,6 +88,31 @@ Software License set forth in the LICENSE.txt file accompanying this software.
         with RoleRaw, SQLAlias, and DatabaseName.
         Requires PowerShell running as Administrator with the AR service account
         (or an account with read access to sys.databases on the SQL Server).
+
+    SQL Parallelism Check (KB 4383609):
+        Reads "cost threshold for parallelism" and "max degree of parallelism"
+        from sys.configurations on the SQL Server hosting the Configuration DB.
+        Compares the running values against One Identity's recommended baseline:
+        Cost Threshold for Parallelism = 50 (or higher), MaxDOP = 4.
+        Non-compliant values are flagged with a recommendation to engage the DBA.
+
+    Version History:
+        1.1
+          - Users per Domain chart now renders as a stacked bar (Enabled +
+            Disabled) with a new "Disabled" column in the per-domain table.
+          - Dynamic Groups: new "Distribution Across Servers" panel showing
+            how Dynamic Groups are spread across Active Roles instances,
+            with an imbalance warning when applicable.
+          - Dynamic Groups: new "Expensive LDAP Queries" panel listing the
+            top 10 groups by accountNameHistory length, flagging any with
+            >= 1000 entries as Expensive (potential AR / DC overhead).
+          - New SQL Parallelism Settings check (section 3.5) validating
+            Cost Threshold for Parallelism and MaxDOP against One Identity's
+            recommendations (KB 4383609).
+          - Additional References now includes KB 4383609 (Recommended SQL
+            settings for Active Roles performance).
+        1.0
+          - Initial release.
 #>
 
 [CmdletBinding()]
@@ -549,6 +574,7 @@ function Get-ManagedUserCounts {
         HybridTotal       = 0
         GmsaTotal         = 0
         ExcludedTotal     = 0
+        DisabledTotal     = 0
         PerDomain         = @()
         ExcludedOUs       = @()
         ExcludedMUs       = @()
@@ -632,12 +658,13 @@ function Get-ManagedUserCounts {
         $hybridCount   = 0
         $gmsaCount     = 0
         $excludedCount = 0
+        $disabledCount = 0
 
         # On-prem user count via EDMS
         try {
             $userResults = Invoke-EDMSSearch -SearchRoot $domainDN `
                 -LDAPFilter "(&(objectClass=user)(objectCategory=person))" `
-                -Properties @("distinguishedName")
+                -Properties @("distinguishedName","userAccountControl")
 
             foreach ($u in $userResults) {
                 $uDN = $u.Properties["distinguishedname"][0]
@@ -649,11 +676,21 @@ function Get-ManagedUserCounts {
                         if ($uDN -like "*,$ou") { $isExcluded = $true; break }
                     }
                 }
-                if ($isExcluded) { $excludedCount++ } else { $userCount++ }
+                if ($isExcluded) {
+                    $excludedCount++
+                } else {
+                    $userCount++
+                    $uac = 0
+                    if ($u.Properties["useraccountcontrol"].Count -gt 0) {
+                        $uac = [int]$u.Properties["useraccountcontrol"][0]
+                    }
+                    # ACCOUNTDISABLE = 0x2
+                    if ($uac -band 0x2) { $disabledCount++ }
+                }
             }
             if ($userResults) { $userResults.Dispose() }
 
-            Write-Log "Domain '$domainName': $userCount managed user(s), $excludedCount excluded"
+            Write-Log "Domain '$domainName': $userCount managed user(s), $disabledCount disabled, $excludedCount excluded"
         }
         catch {
             Write-Log "Could not count users for domain '$domainName': $($_.Exception.Message)" -Level "WARN"
@@ -720,6 +757,7 @@ function Get-ManagedUserCounts {
             onprem   = if ($userCount -ge 0) { [math]::Max(0, $userCount - $hybridCount) } else { -1 }
             gmsa     = $gmsaCount
             excluded = $excludedCount
+            disabled = $disabledCount
         }
     }
 
@@ -728,8 +766,10 @@ function Get-ManagedUserCounts {
     $result.HybridTotal  = ($result.PerDomain | Measure-Object -Property hybrid -Sum).Sum
     $result.GmsaTotal    = ($result.PerDomain | Measure-Object -Property gmsa -Sum).Sum
     $result.ExcludedTotal = ($result.PerDomain | Measure-Object -Property excluded -Sum).Sum
+    $result.DisabledTotal = ($result.PerDomain | Measure-Object -Property disabled -Sum).Sum
 
     Write-Log "Total managed users across all domains: $($result.TotalCount)"
+    Write-Log "Total disabled users: $($result.DisabledTotal)"
     Write-Log "Total hybrid accounts: $($result.HybridTotal)"
     Write-Log "Total gMSA accounts: $($result.GmsaTotal)"
     Write-Log "Total users in excluded OUs/MUs: $($result.ExcludedTotal)"
@@ -1001,23 +1041,111 @@ function Get-MHReplicationPartnersInfo {
 }
 
 function Get-DynamicGroupsInfo {
+    param(
+        [int]$ServerCount = 1
+    )
+
     $result = [PSCustomObject]@{
-        TotalCount   = 0
-        BrokenCount  = 0
-        BrokenList   = @()
-        Error        = $null
-        SkippedCheck = $SkipBrokenRulesCheck.IsPresent
+        TotalCount        = 0
+        BrokenCount       = 0
+        BrokenList        = @()
+        Error             = $null
+        SkippedCheck      = $SkipBrokenRulesCheck.IsPresent
+        Distribution      = @()
+        UnassignedCount   = 0
+        HostingServers    = 0
+        EnvironmentServers= $ServerCount
+        IsImbalanced      = $false
+        ImbalanceReason   = ''
+        TopExpensive      = @()
+        ExpensiveShown    = 10
+        ExpensiveThreshold= 1000
+        ExpensiveCount    = 0
     }
 
     try {
         Write-Log "Collecting Dynamic Groups..."
         $dynGroups = Get-QADGroup -Dynamic $true `
             -DontUseDefaultIncludedProperties `
-            -IncludedProperties 'name', 'edsaDGConditionsList' `
+            -IncludedProperties 'name', 'DN', 'edsaDGConditionsList', 'edsaDGOriginatingService', 'accountNameHistory' `
             -proxy -SizeLimit 0 -ErrorAction Stop
 
         $result.TotalCount = @($dynGroups).Count
         Write-Log "Found $($result.TotalCount) Dynamic Group(s)"
+
+        # Top expensive dynamic groups (by accountNameHistory length)
+        if ($result.TotalCount -gt 0) {
+            $expensive = foreach ($g in $dynGroups) {
+                $len = 0
+                try {
+                    $hist = $g.accountNameHistory
+                    if ($hist) { $len = @($hist).Count }
+                } catch { }
+                [PSCustomObject]@{
+                    Name   = ConvertTo-SafeHtml $g.Name
+                    DN     = ConvertTo-SafeHtml $g.DN
+                    Length = $len
+                }
+            }
+            $sortedExpensive = @($expensive | Sort-Object -Property Length -Descending)
+            $result.TopExpensive   = @($sortedExpensive | Select-Object -First $result.ExpensiveShown)
+            $result.ExpensiveCount = @($sortedExpensive | Where-Object { $_.Length -ge $result.ExpensiveThreshold }).Count
+            Write-Log "Dynamic Groups with accountNameHistory >= $($result.ExpensiveThreshold): $($result.ExpensiveCount) (max length: $($result.TopExpensive[0].Length))"
+        }
+
+        if ($result.TotalCount -gt 0) {
+            # Build distribution map by originating service
+            $distMap = @{}
+            $unassigned = 0
+            foreach ($g in $dynGroups) {
+                $svc = $null
+                try { $svc = $g.edsaDGOriginatingService } catch { }
+                if (-not $svc) {
+                    $unassigned++
+                    continue
+                }
+                # Extract first CN if DN; otherwise use raw value
+                $svcLabel = if ([string]$svc -match '^CN=([^,]+)') { $matches[1] } else { [string]$svc }
+                if ($distMap.ContainsKey($svcLabel)) {
+                    $distMap[$svcLabel]++
+                } else {
+                    $distMap[$svcLabel] = 1
+                }
+            }
+
+            $result.UnassignedCount = $unassigned
+            $result.HostingServers  = $distMap.Keys.Count
+            $totalAssigned          = $result.TotalCount - $unassigned
+
+            if ($totalAssigned -gt 0) {
+                $result.Distribution = @($distMap.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
+                    [PSCustomObject]@{
+                        Service    = ConvertTo-SafeHtml $_.Key
+                        Count      = [int]$_.Value
+                        Percentage = [math]::Round(($_.Value / $totalAssigned) * 100, 1)
+                    }
+                })
+
+                # Imbalance detection (only meaningful with 2+ servers in the environment)
+                if ($ServerCount -gt 1) {
+                    $counts   = @($result.Distribution | ForEach-Object { $_.Count })
+                    $maxCount = ($counts | Measure-Object -Maximum).Maximum
+                    $minCount = ($counts | Measure-Object -Minimum).Minimum
+
+                    if ($result.HostingServers -lt $ServerCount) {
+                        $result.IsImbalanced    = $true
+                        $result.ImbalanceReason = "Only $($result.HostingServers) of $ServerCount server(s) host Dynamic Groups"
+                    }
+                    elseif ($minCount -gt 0 -and ($maxCount / $minCount) -gt 2) {
+                        $result.IsImbalanced    = $true
+                        $ratio = [math]::Round($maxCount / $minCount, 1)
+                        $result.ImbalanceReason = "Highest server has ${ratio}x more Dynamic Groups than the lowest"
+                    }
+                }
+
+                Write-Log "Dynamic Groups distribution: $($result.HostingServers) host(s), $totalAssigned assigned, $unassigned unassigned. Imbalanced=$($result.IsImbalanced)"
+            }
+        }
 
         if (-not $SkipBrokenRulesCheck -and $result.TotalCount -gt 0) {
             Write-Log "Checking Dynamic Groups for broken rules (this may take a while)..."
@@ -1660,6 +1788,110 @@ function Get-AlwaysOnInfo {
     return $result
 }
 
+function Get-SqlParallelismInfo {
+    <#
+    .SYNOPSIS
+        Reads "cost threshold for parallelism" and "max degree of parallelism"
+        from sys.configurations on the SQL Server hosting the Active Roles
+        Configuration database. Compares the values against One Identity's
+        recommended values (KB 4383609): CostThreshold = 50, MaxDOP = 4.
+    #>
+    param(
+        [Parameter(Mandatory)]$ReplicationPartners,
+        [System.Management.Automation.PSCredential]$SqlCredential,
+        [int]$RecommendedCostThreshold = 50,
+        [int]$RecommendedMaxDOP        = 4
+    )
+
+    $result = [PSCustomObject]@{
+        Checked                  = $false
+        SqlServer                = $null
+        DatabaseName             = $null
+        CostThresholdConfigured  = $null
+        CostThresholdRunning     = $null
+        MaxDOPConfigured         = $null
+        MaxDOPRunning            = $null
+        RecommendedCostThreshold = $RecommendedCostThreshold
+        RecommendedMaxDOP        = $RecommendedMaxDOP
+        CostThresholdOk          = $false
+        MaxDOPOk                 = $false
+        Error                    = $null
+    }
+
+    try {
+        if (-not $ReplicationPartners.List -or $ReplicationPartners.List.Count -eq 0) {
+            Write-Log "No replication partners available for SQL parallelism check" -Level "WARN"
+            $result.Error = "No replication partners available"
+            return $result
+        }
+
+        $publisher = $ReplicationPartners.List | Where-Object { $_.RoleRaw -eq '1' } | Select-Object -First 1
+        if (-not $publisher) {
+            $publisher = $ReplicationPartners.List | Select-Object -First 1
+            Write-Log "No Publisher found, using first available partner '$($publisher.Name)' for SQL parallelism check"
+        }
+
+        $sqlAlias = $publisher.SQLAlias
+        $dbName   = $publisher.DatabaseName
+
+        if (-not $sqlAlias -or $sqlAlias -eq 'N/A') {
+            Write-Log "Missing SQL alias on Publisher partner '$($publisher.Name)'" -Level "WARN"
+            $result.Error = "Missing SQL alias on Publisher"
+            return $result
+        }
+
+        $result.SqlServer    = $sqlAlias
+        $result.DatabaseName = $dbName
+
+        if ($SqlCredential) {
+            Write-Log "SQL parallelism check: connecting to '$sqlAlias' using SQL Authentication (user: $($SqlCredential.UserName))"
+        }
+        else {
+            Write-Log "SQL parallelism check: connecting to '$sqlAlias' using Windows Authentication"
+        }
+
+        $conn = New-ArSqlConnection -SqlServer $sqlAlias -SqlCredential $SqlCredential
+
+        $query = @"
+SELECT name, value, value_in_use
+FROM sys.configurations
+WHERE name IN ('cost threshold for parallelism', 'max degree of parallelism')
+"@
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = $query
+        $reader = $cmd.ExecuteReader()
+
+        while ($reader.Read()) {
+            $name        = [string]$reader["name"]
+            $valueConfig = [int]$reader["value"]
+            $valueRun    = [int]$reader["value_in_use"]
+
+            if ($name -eq 'cost threshold for parallelism') {
+                $result.CostThresholdConfigured = $valueConfig
+                $result.CostThresholdRunning    = $valueRun
+            }
+            elseif ($name -eq 'max degree of parallelism') {
+                $result.MaxDOPConfigured = $valueConfig
+                $result.MaxDOPRunning    = $valueRun
+            }
+        }
+        $reader.Close()
+        $conn.Close()
+
+        $result.Checked         = $true
+        $result.CostThresholdOk = ($null -ne $result.CostThresholdRunning -and $result.CostThresholdRunning -ge $RecommendedCostThreshold)
+        $result.MaxDOPOk        = ($null -ne $result.MaxDOPRunning -and $result.MaxDOPRunning -eq $RecommendedMaxDOP)
+
+        Write-Log "SQL parallelism on '$sqlAlias': CostThreshold(running)=$($result.CostThresholdRunning) (recommended >= $RecommendedCostThreshold), MaxDOP(running)=$($result.MaxDOPRunning) (recommended = $RecommendedMaxDOP)"
+    }
+    catch {
+        Write-Log "SQL parallelism check failed: $($_.Exception.Message)" -Level "WARN"
+        $result.Error = $_.Exception.Message
+    }
+
+    return $result
+}
+
 function Get-ExchangePresenceInfo {
     <#
     .SYNOPSIS
@@ -1823,7 +2055,8 @@ function New-HtmlReport {
         [PSCustomObject]$AzureTenants,
         [PSCustomObject]$ExchangeInfo,
         [PSCustomObject]$AutoShrinkInfo,
-        [PSCustomObject]$AlwaysOnInfo
+        [PSCustomObject]$AlwaysOnInfo,
+        [PSCustomObject]$SqlParallelismInfo
     )
 
     $reportDate    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -1941,6 +2174,128 @@ function New-HtmlReport {
         $dgBrokenSection = '<p class="ok-note">&#10003; No broken membership rules detected.</p>'
     }
 
+    # -- Dynamic Groups distribution across servers ---------------------------------
+    if ($DynamicGroups.TotalCount -eq 0) {
+        $dgDistributionSection = '<p class="ok-note">&#8505; No Dynamic Groups in the environment.</p>'
+    } else {
+        $dgDistRows = ""
+        $maxDist = if ($DynamicGroups.Distribution.Count -gt 0) {
+            ($DynamicGroups.Distribution | Measure-Object -Property Count -Maximum).Maximum
+        } else { 0 }
+
+        foreach ($d in $DynamicGroups.Distribution) {
+            $barWidth = if ($maxDist -gt 0) { [math]::Round(($d.Count / $maxDist) * 100, 0) } else { 0 }
+            $dgDistRows += @"
+        <tr>
+          <td>$($d.Service)</td>
+          <td style="text-align:right;font-weight:600">$($d.Count)</td>
+          <td style="text-align:right">$($d.Percentage)%</td>
+          <td style="width:40%">
+            <div style="background:#e5e7eb;border-radius:4px;height:10px;overflow:hidden">
+              <div style="background:#7c3aed;height:100%;width:${barWidth}%"></div>
+            </div>
+          </td>
+        </tr>
+"@
+        }
+        if ($DynamicGroups.UnassignedCount -gt 0) {
+            $dgDistRows += @"
+        <tr>
+          <td><em class="muted">(Unassigned / Unknown service)</em></td>
+          <td style="text-align:right;font-weight:600">$($DynamicGroups.UnassignedCount)</td>
+          <td style="text-align:right">&mdash;</td>
+          <td>&nbsp;</td>
+        </tr>
+"@
+        }
+
+        $dgDistAlert = if ($DynamicGroups.EnvironmentServers -le 1) {
+            '<p class="ok-note" style="margin-bottom:12px">&#8505; Standalone environment &mdash; distribution analysis not applicable.</p>'
+        }
+        elseif ($DynamicGroups.IsImbalanced) {
+            @"
+        <div class="alert-box" style="margin-bottom:12px">
+          &#9888; <strong>Dynamic Groups are not evenly distributed</strong> across the $($DynamicGroups.EnvironmentServers) Active Roles servers.
+          <br>$($DynamicGroups.ImbalanceReason).
+          <br><span style="font-size:.78rem">Concentrating Dynamic Group recalculation on a single server may impact performance. If a dedicated Dynamic Group server is intentional, this warning can be ignored.</span>
+        </div>
+"@
+        }
+        else {
+            '<p class="ok-note" style="margin-bottom:12px">&#10003; Dynamic Groups are evenly distributed across servers.</p>'
+        }
+
+        $dgDistributionSection = @"
+        $dgDistAlert
+        <table>
+          <thead><tr><th>Originating Service</th><th style="text-align:right">Dynamic Groups</th><th style="text-align:right">Share</th><th>Distribution</th></tr></thead>
+          <tbody>$dgDistRows</tbody>
+        </table>
+"@
+    }
+
+    # -- Dynamic Groups: top expensive LDAP queries ---------------------------------
+    if ($DynamicGroups.TotalCount -eq 0) {
+        $dgExpensiveSection = '<p class="ok-note">&#8505; No Dynamic Groups to analyze.</p>'
+    } else {
+        $dgExpRows = ""
+        $expThreshold = $DynamicGroups.ExpensiveThreshold
+        $maxExpLen = if ($DynamicGroups.TopExpensive.Count -gt 0) {
+            ($DynamicGroups.TopExpensive | Measure-Object -Property Length -Maximum).Maximum
+        } else { 0 }
+
+        foreach ($e in $DynamicGroups.TopExpensive) {
+            $barWidth = if ($maxExpLen -gt 0) { [math]::Round(($e.Length / $maxExpLen) * 100, 0) } else { 0 }
+            $isExpensive = $e.Length -ge $expThreshold
+            $statusBadge = if ($isExpensive) {
+                '<span class="badge badge-red">Expensive</span>'
+            } else {
+                '<span class="badge badge-green">OK</span>'
+            }
+            $barColor = if ($isExpensive) { '#dc2626' } else { '#16a34a' }
+            $dgExpRows += @"
+        <tr>
+          <td>$($e.Name)</td>
+          <td class="dn-cell">$($e.DN)</td>
+          <td style="text-align:right;font-weight:600">$($e.Length)</td>
+          <td style="width:22%">
+            <div style="background:#e5e7eb;border-radius:4px;height:10px;overflow:hidden">
+              <div style="background:$barColor;height:100%;width:${barWidth}%"></div>
+            </div>
+          </td>
+          <td style="text-align:center">$statusBadge</td>
+        </tr>
+"@
+        }
+
+        $remaining = $DynamicGroups.TotalCount - $DynamicGroups.ExpensiveShown
+        $dgExpAlert = if ($DynamicGroups.ExpensiveCount -gt 0) {
+            $extraNote = if ($remaining -gt 0) {
+                " There are $remaining additional Dynamic Group(s) not shown in the table &mdash; review all groups, not only the top $($DynamicGroups.ExpensiveShown)."
+            } else { '' }
+            @"
+        <div class="alert-box" style="margin-bottom:12px">
+          &#9888; <strong>$($DynamicGroups.ExpensiveCount) Dynamic Group(s)</strong> exceed the threshold of <strong>$expThreshold</strong> entries in <code>accountNameHistory</code>.
+          <br><span style="font-size:.78rem">Active Roles Administrators are advised to review these groups. Large LDAP queries can cause overhead on the Active Roles service and the Domain Controllers.$extraNote</span>
+        </div>
+"@
+        } elseif ($remaining -gt 0) {
+            @"
+        <p class="ok-note" style="margin-bottom:12px">&#10003; No Dynamic Group exceeds the threshold of $expThreshold entries. Showing the top $($DynamicGroups.ExpensiveShown) of $($DynamicGroups.TotalCount) by size.</p>
+"@
+        } else {
+            "<p class=`"ok-note`" style=`"margin-bottom:12px`">&#10003; No Dynamic Group exceeds the threshold of $expThreshold entries.</p>"
+        }
+
+        $dgExpensiveSection = @"
+        $dgExpAlert
+        <table>
+          <thead><tr><th>Group Name</th><th>Distinguished Name</th><th style="text-align:right">accountNameHistory Length</th><th>Relative Size</th><th style="text-align:center">Status</th></tr></thead>
+          <tbody>$dgExpRows</tbody>
+        </table>
+"@
+    }
+
     # -- Managed Units broken rules section -------------------------------------
     if ($ManagedUnits.SkippedCheck) {
         $muBrokenSection = '<p class="skipped-note">&#9197; Broken rules check skipped (<code>-SkipBrokenRulesCheck</code>).</p>'
@@ -1960,13 +2315,17 @@ function New-HtmlReport {
     # -- Managed User Counts data for chart ----------------------------------
     $userCountChartData = if ($ManagedUserCounts.PerDomain -and $ManagedUserCounts.PerDomain.Count -gt 0) {
         ConvertTo-Json @($ManagedUserCounts.PerDomain | Where-Object { $_.count -ge 0 } |
-            Select-Object @{N='name';E={$_.name}}, @{N='value';E={$_.count}}) -Compress
+            Select-Object @{N='name';E={$_.name}},
+                          @{N='enabled';E={[math]::Max(0, $_.count - $_.disabled)}},
+                          @{N='disabled';E={$_.disabled}}) -Compress
     } else { '[]' }
     $safeTotalUsers    = [math]::Max(0, $ManagedUserCounts.TotalCount)
     $safeHybridTotal   = [math]::Max(0, $ManagedUserCounts.HybridTotal)
     $safeGmsaTotal     = [math]::Max(0, $ManagedUserCounts.GmsaTotal)
     $safeExcludedTotal = [math]::Max(0, $ManagedUserCounts.ExcludedTotal)
+    $safeDisabledTotal = [math]::Max(0, $ManagedUserCounts.DisabledTotal)
     $safeOnPremTotal = [math]::Max(0, $safeTotalUsers - $safeHybridTotal)
+    $safeEnabledTotal = [math]::Max(0, $safeTotalUsers - $safeDisabledTotal)
 
     # Cloud-only = Azure Users (all tenants) - Hybrid accounts
     $azureUsersTotal = 0
@@ -2299,16 +2658,17 @@ $(if ($ManagedUserCounts.Skipped) {@"
   <h2>Users per Domain</h2>
   <div style="overflow-x:auto">
   <table>
-    <thead><tr><th>Domain</th><th style="text-align:right">Total Users</th><th style="text-align:right">On-Prem Only</th><th style="text-align:right">Hybrid</th><th style="text-align:right">gMSA</th><th style="text-align:right">Excluded OUs Users</th></tr></thead>
+    <thead><tr><th>Domain</th><th style="text-align:right">Total Users</th><th style="text-align:right">Disabled</th><th style="text-align:right">On-Prem Only</th><th style="text-align:right">Hybrid</th><th style="text-align:right">gMSA</th><th style="text-align:right">Excluded OUs Users</th></tr></thead>
     <tbody>
 $(($ManagedUserCounts.PerDomain | ForEach-Object {
-    $countDisplay  = if ($_.count -ge 0)  { Format-Count $_.count }  else { '<span class="muted">Error</span>' }
-    $onpremDisplay = if ($_.onprem -ge 0) { Format-Count $_.onprem } else { '<span class="muted">Error</span>' }
-    "      <tr><td>$($_.name)</td><td style='text-align:right;font-weight:600'>$countDisplay</td><td style='text-align:right'>$onpremDisplay</td><td style='text-align:right'>$(Format-Count $_.hybrid)</td><td style='text-align:right'>$(Format-Count $_.gmsa)</td><td style='text-align:right'>$(Format-Count $_.excluded)</td></tr>"
+    $countDisplay    = if ($_.count -ge 0)  { Format-Count $_.count }  else { '<span class="muted">Error</span>' }
+    $onpremDisplay   = if ($_.onprem -ge 0) { Format-Count $_.onprem } else { '<span class="muted">Error</span>' }
+    $disabledDisplay = if ($_.count -ge 0)  { Format-Count $_.disabled } else { '<span class="muted">Error</span>' }
+    "      <tr><td>$($_.name)</td><td style='text-align:right;font-weight:600'>$countDisplay</td><td style='text-align:right'>$disabledDisplay</td><td style='text-align:right'>$onpremDisplay</td><td style='text-align:right'>$(Format-Count $_.hybrid)</td><td style='text-align:right'>$(Format-Count $_.gmsa)</td><td style='text-align:right'>$(Format-Count $_.excluded)</td></tr>"
 }) -join "`n")
     </tbody>
     <tfoot>
-      <tr style="border-top:2px solid #e5e7eb;font-weight:700"><td>Subtotal (AD)</td><td style="text-align:right">$(Format-Count $safeTotalUsers)</td><td style="text-align:right">$(Format-Count $safeOnPremTotal)</td><td style="text-align:right">$(Format-Count $safeHybridTotal)</td><td style="text-align:right">$(Format-Count $safeGmsaTotal)</td><td style="text-align:right">$(Format-Count $safeExcludedTotal)</td></tr>
+      <tr style="border-top:2px solid #e5e7eb;font-weight:700"><td>Subtotal (AD)</td><td style="text-align:right">$(Format-Count $safeTotalUsers)</td><td style="text-align:right">$(Format-Count $safeDisabledTotal)</td><td style="text-align:right">$(Format-Count $safeOnPremTotal)</td><td style="text-align:right">$(Format-Count $safeHybridTotal)</td><td style="text-align:right">$(Format-Count $safeGmsaTotal)</td><td style="text-align:right">$(Format-Count $safeExcludedTotal)</td></tr>
     </tfoot>
   </table>
   </div>
@@ -2572,6 +2932,82 @@ $(if ($alwaysOnChecked) {
 </div>
 "@})
 
+<!-- =========================== 3.5 SQL PARALLELISM ===================== -->
+<div class="sec-title" id="sec-sqlpar"><span class="sec-icon">3.5</span>SQL Server Parallelism Settings</div>
+$(if ($SqlParallelismInfo.Checked) {
+    $ctRunning   = $SqlParallelismInfo.CostThresholdRunning
+    $ctConfig    = $SqlParallelismInfo.CostThresholdConfigured
+    $maxRunning  = $SqlParallelismInfo.MaxDOPRunning
+    $maxConfig   = $SqlParallelismInfo.MaxDOPConfigured
+    $recCT       = $SqlParallelismInfo.RecommendedCostThreshold
+    $recMax      = $SqlParallelismInfo.RecommendedMaxDOP
+    $ctOk        = $SqlParallelismInfo.CostThresholdOk
+    $maxOk       = $SqlParallelismInfo.MaxDOPOk
+    $ctBadge     = if ($ctOk)  { '<span class="badge badge-green">OK</span>' }  else { '<span class="badge badge-red">Action Required</span>' }
+    $maxBadge    = if ($maxOk) { '<span class="badge badge-green">OK</span>' } else { '<span class="badge badge-red">Action Required</span>' }
+    $allOk       = $ctOk -and $maxOk
+@"
+<div class="panel">
+  <h2>Parallelism &nbsp;$(if($allOk){'<span class="badge badge-green">OK</span>'}else{'<span class="badge badge-red">Action Required</span>'})</h2>
+  <p style="font-size:0.9rem;color:#374151;margin-bottom:12px">
+    SQL Server <code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-weight:600">$($SqlParallelismInfo.SqlServer)</code>
+    parallelism settings compared against One Identity recommendations for Active Roles performance.
+  </p>
+  <table>
+    <thead><tr><th>Setting</th><th style="text-align:right">Configured</th><th style="text-align:right">Running</th><th style="text-align:right">Recommended</th><th style="text-align:center">Status</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Cost Threshold for Parallelism</td>
+        <td style="text-align:right;font-weight:600">$ctConfig</td>
+        <td style="text-align:right;font-weight:600">$ctRunning</td>
+        <td style="text-align:right">$recCT (or higher)</td>
+        <td style="text-align:center">$ctBadge</td>
+      </tr>
+      <tr>
+        <td>Max Degree of Parallelism (MaxDOP)</td>
+        <td style="text-align:right;font-weight:600">$maxConfig</td>
+        <td style="text-align:right;font-weight:600">$maxRunning</td>
+        <td style="text-align:right">$recMax</td>
+        <td style="text-align:center">$maxBadge</td>
+      </tr>
+    </tbody>
+  </table>
+$(if (-not $allOk) {@"
+  <div style="margin-top:12px;padding:16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;">
+    <strong style="color:#92400e">&#9888; One or more SQL parallelism settings do not match the recommended values</strong>
+    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+      Engage your SQL Database Administrator (DBA) to review the current parallelism configuration and evaluate
+      adjusting these values to One Identity's recommended baseline:
+      <strong>Cost Threshold for Parallelism = $recCT (or higher)</strong> and
+      <strong>Max Degree of Parallelism = $recMax</strong>.
+    </p>
+    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+      Misconfigured parallelism can impact Active Roles query performance, especially under load. Any change
+      should be validated against the broader SQL workload on this instance.
+    </p>
+    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+      See <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#2563eb">KB 4383609</a> &mdash; Recommended SQL settings for Active Roles performance.
+    </p>
+  </div>
+"@} else {@"
+  <p class="ok-note" style="margin-top:12px">&#10003; Both parallelism settings match the recommended baseline. See <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#2563eb">KB 4383609</a> for details.</p>
+"@})
+</div>
+"@
+} else {@"
+<div class="panel">
+  <h2>Parallelism &nbsp;<span class="badge badge-gray">Not Checked</span></h2>
+  <div style="margin-top:8px;padding:16px;background:#f3f4f6;border:1px solid #d1d5db;border-radius:8px;">
+    <p style="color:#4b5563;font-size:0.9rem">
+      Could not verify SQL parallelism settings.$(if ($SqlParallelismInfo.Error) { " Error: $($SqlParallelismInfo.Error)" } else { " The Configuration DB could not be discovered or connected to." })
+    </p>
+    <p style="margin-top:8px;color:#4b5563;font-size:0.9rem">
+      See <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#2563eb">KB 4383609</a> &mdash; Recommended SQL settings for Active Roles performance.
+    </p>
+  </div>
+</div>
+"@})
+
 <!-- =========================== 04 DYNAMIC GROUPS ======================= -->
 <div class="sec-title" id="sec-dyngroups"><span class="sec-icon">04</span>Dynamic Groups</div>
 <div class="panel-grid">
@@ -2593,6 +3029,17 @@ $(if ($alwaysOnChecked) {
     <h2>Broken Rules Details</h2>
     $dgBrokenSection
   </div>
+</div>
+<div class="panel panel-full" style="margin-top:20px">
+  <h2>Distribution Across Servers &nbsp;<span class="badge badge-blue">$(Format-Count $DynamicGroups.HostingServers) of $(Format-Count $DynamicGroups.EnvironmentServers) server(s) hosting</span></h2>
+  $dgDistributionSection
+</div>
+<div class="panel panel-full" style="margin-top:20px">
+  <h2>Expensive LDAP Queries &nbsp;<span class="badge badge-blue">Top $($DynamicGroups.ExpensiveShown) of $(Format-Count $DynamicGroups.TotalCount)</span> &nbsp;<span class="badge $(if($DynamicGroups.ExpensiveCount -gt 0){'badge-red'}else{'badge-green'})">$($DynamicGroups.ExpensiveCount) above threshold</span></h2>
+  <p style="font-size:.82rem;color:#6b7280;margin-bottom:12px">
+    Dynamic Groups whose membership produces a large result set (high <code>accountNameHistory</code> length) translate into expensive LDAP queries that can impact both the Active Roles service and the Domain Controllers. Groups with <strong>$($DynamicGroups.ExpensiveThreshold)+</strong> entries are flagged as <em>Expensive</em>.
+  </p>
+  $dgExpensiveSection
 </div>
 
 <!-- =========================== 05 MANAGED UNITS ======================== -->
@@ -2833,16 +3280,20 @@ $(if ($safeOrphanAt -gt 0) {@"
     <p style="margin:0;line-height:1.6;color:#374151">
       This report covers the most common health checks for Active Roles. For a comprehensive list
       of additional known issues, workarounds, and troubleshooting references, please consult the
-      official One Identity Knowledge Base article:
+      official One Identity Knowledge Base articles:
     </p>
     <p style="margin:12px 0 0 0">
       <a href="https://support.oneidentity.com/kb/4340870" target="_blank" rel="noopener noreferrer"
-         style="display:inline-block;padding:10px 16px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px;font-weight:600">
+         style="display:inline-block;padding:10px 16px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;margin-right:8px;margin-bottom:8px">
         One Identity KB 4340870 &mdash; Active Roles Known Issues &rarr;
+      </a>
+      <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener noreferrer"
+         style="display:inline-block;padding:10px 16px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;margin-bottom:8px">
+        One Identity KB 4383609 &mdash; Recommended SQL settings for Active Roles performance &rarr;
       </a>
     </p>
     <p style="margin:12px 0 0 0;font-size:.85rem;color:#6b7280">
-      Review this knowledge base periodically as One Identity publishes updates, hotfixes and
+      Review these knowledge bases periodically as One Identity publishes updates, hotfixes and
       advisories for the product.
     </p>
   </div>
@@ -2902,28 +3353,40 @@ const doughnutOpts = {
   cutout: '62%'
 };
 
-// Managed Users per Domain chart
+// Managed Users per Domain chart (stacked: Enabled + Disabled)
 const UC_DATA = $userCountChartData;
 if (UC_DATA && UC_DATA.length > 0) {
   new Chart(document.getElementById('userCountChart'), {
     type: 'bar',
     data: {
       labels: UC_DATA.map(d => d.name || 'N/A'),
-      datasets: [{
-        label: 'Users',
-        data: UC_DATA.map(d => d.value || 0),
-        backgroundColor: ['#0d9488','#2563eb','#7c3aed','#d97706','#db2777','#16a34a','#ea580c','#6366f1'].slice(0, UC_DATA.length),
-        borderRadius: 6,
-        maxBarThickness: 60
-      }]
+      datasets: [
+        {
+          label: 'Enabled',
+          data: UC_DATA.map(d => d.enabled || 0),
+          backgroundColor: '#16a34a',
+          borderRadius: 6,
+          maxBarThickness: 60
+        },
+        {
+          label: 'Disabled',
+          data: UC_DATA.map(d => d.disabled || 0),
+          backgroundColor: '#dc2626',
+          borderRadius: 6,
+          maxBarThickness: 60
+        }
+      ]
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: { display: true, position: 'bottom', labels: { boxWidth: 14, padding: 16 } },
+        tooltip: { mode: 'index', intersect: false }
+      },
       scales: {
-        y: { beginAtZero: true, ticks: { precision: 0 }, grid: { color: '#f3f4f6' } },
-        x: { grid: { display: false } }
+        x: { stacked: true, grid: { display: false } },
+        y: { stacked: true, beginAtZero: true, ticks: { precision: 0 }, grid: { color: '#f3f4f6' } }
       }
     }
   });
@@ -3077,6 +3540,7 @@ try {
             HybridTotal   = 0
             GmsaTotal     = 0
             ExcludedTotal = 0
+            DisabledTotal = 0
             PerDomain     = @()
             ExcludedOUs   = @()
             Skipped       = $true
@@ -3092,7 +3556,7 @@ try {
     Write-Log "Collecting MH replication partners..."
     $mhReplPartners = Get-MHReplicationPartnersInfo
 
-    $dynGroups    = Get-DynamicGroupsInfo
+    $dynGroups    = Get-DynamicGroupsInfo -ServerCount ([math]::Max(1, @($servers.Servers).Count))
     $managedUnits = Get-ManagedUnitsInfo
 
     Write-Log "Collecting workflow info..."
@@ -3143,6 +3607,11 @@ try {
     if ($SqlCredential) { $alwaysOnParams['SqlCredential'] = $SqlCredential }
     $alwaysOnInfo = Get-AlwaysOnInfo @alwaysOnParams
 
+    Write-Log "Checking SQL Server parallelism settings (Cost Threshold, MaxDOP)..."
+    $sqlParParams = @{ ReplicationPartners = $replPartners }
+    if ($SqlCredential) { $sqlParParams['SqlCredential'] = $SqlCredential }
+    $sqlParallelismInfo = Get-SqlParallelismInfo @sqlParParams
+
     # Build and save the HTML report
     Write-Log "Building HTML report..."
     $html = New-HtmlReport `
@@ -3166,7 +3635,8 @@ try {
         -AzureTenants        $azureTenants `
         -ExchangeInfo        $exchangeInfo `
         -AutoShrinkInfo      $autoShrinkInfo `
-        -AlwaysOnInfo        $alwaysOnInfo
+        -AlwaysOnInfo        $alwaysOnInfo `
+        -SqlParallelismInfo  $sqlParallelismInfo
 
     $html | Out-File -FilePath $OutputPath -Encoding UTF8 -Force
 
