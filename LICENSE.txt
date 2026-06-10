@@ -1,5 +1,5 @@
 One Identity Permissive Software License
-Version 1.1
+Version 1.2
 
 Copyright 2026 One Identity LLC.
 All rights reserved.
