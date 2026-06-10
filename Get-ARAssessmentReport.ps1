@@ -76,7 +76,7 @@ Software License set forth in the LICENSE.txt file accompanying this software.
 .NOTES
     Requires  : Active Roles Management Shell
     Run on    : Active Roles Server (for registry-based version detection)
-    Version   : 1.1
+    Version   : 1.2
     Author    : One Identity IDAM3 Team
 
     Auto Shrink Check:
@@ -92,11 +92,48 @@ Software License set forth in the LICENSE.txt file accompanying this software.
     SQL Parallelism Check (KB 4383609):
         Reads "cost threshold for parallelism" and "max degree of parallelism"
         from sys.configurations on the SQL Server hosting the Configuration DB.
-        Compares the running values against One Identity's recommended baseline:
-        Cost Threshold for Parallelism = 50 (or higher), MaxDOP = 4.
+        Cost Threshold for Parallelism is compared against One Identity's
+        recommended baseline of 50 (or higher). MaxDOP has no single recommended
+        value; MaxDOP = 0 (unlimited) is flagged as an error (Action Required)
+        on every SQL Server version, with a version-aware explanation:
+          - SQL Server 2017 (14.x) and earlier: 0 is the engine default and
+            must be changed manually.
+          - SQL Server 2019 (15.x) and later: setup auto-detects a recommended
+            MaxDOP, so 0 means the value was overridden after installation.
+        Non-zero values are reported as Verify. In every case the report
+        directs the administrator to run the SQL script attached to KB 4383609
+        and confirm/set MaxDOP from its output.
         Non-compliant values are flagged with a recommendation to engage the DBA.
 
     Version History:
+        1.2
+          - MaxDOP recommendation no longer hardcodes "4": the report now flags
+            MaxDOP = 0 (Action Required) and instructs to run the SQL script
+            attached to KB 4383609 and set the value based on its output.
+            Non-zero MaxDOP values are shown with an amber "Verify" status,
+            since only the KB script output can confirm the correct value.
+          - New "SQL Parallelism" KPI card in the Environment Summary.
+          - New "Verbose Logging" KPI card in the Environment Summary, shown
+            only when verbose logging is enabled on at least one instance.
+          - Managed Units excluded from managed scope are now listed in the
+            Users per Domain panel (collapsible list), alongside Excluded OUs.
+          - Report restyled with the One Identity brand color palette
+            (One Identity Blue/Black/Gray, Monte Carlo, Jaffa, Jacarta,
+            Loblolly, Blue Lagoon, Quest Orange) and the Noto Sans font
+            (One Identity UI font, served via Google Fonts CDN with Verdana
+            fallback). Status semantics preserved: Monte Carlo = OK,
+            Jaffa = warning/verify, Quest Orange = action required.
+          - One Identity logo embedded inline (SVG, white reverse variant)
+            in the report header above the title; no external image
+            dependency, renders offline.
+          - MaxDOP = 0 is flagged as Action Required on every SQL Server
+            version, with a version-aware explanation: on 2017 (14.x) and
+            earlier it is the engine default and must be set manually; on
+            2019 (15.x)+ setup auto-detects a recommended value, so 0 means
+            it was overridden after installation. Non-zero values show as
+            Verify. The SQL Server version is displayed in section 3.5 and
+            the report always directs to the KB 4383609 script to confirm
+            the value.
         1.1
           - Users per Domain chart now renders as a stacked bar (Enabled +
             Disabled) with a new "Disabled" column in the per-domain table.
@@ -1793,14 +1830,25 @@ function Get-SqlParallelismInfo {
     .SYNOPSIS
         Reads "cost threshold for parallelism" and "max degree of parallelism"
         from sys.configurations on the SQL Server hosting the Active Roles
-        Configuration database. Compares the values against One Identity's
-        recommended values (KB 4383609): CostThreshold = 50, MaxDOP = 4.
+        Configuration database. Compares Cost Threshold against One Identity's
+        recommended baseline (KB 4383609): CostThreshold = 50 (or higher).
+        MaxDOP has no fixed recommended value: the correct value depends on the
+        server hardware and must be determined by running the SQL script
+        attached to KB 4383609.
+        MaxDOP status logic:
+          - MaxDOP = 0 (unlimited) is flagged as ActionRequired on every
+            SQL Server version: on 2017 (14.x) and earlier it is the engine
+            default; on 2019 (15.x)+ setup auto-detects a recommended value,
+            so 0 means it was overridden after installation.
+          - Non-zero values are reported as Verify.
+          - In all cases the value must be confirmed by running the SQL
+            script attached to KB 4383609. The SQL version (read via
+            SERVERPROPERTY('ProductVersion')) tailors the report explanation.
     #>
     param(
         [Parameter(Mandatory)]$ReplicationPartners,
         [System.Management.Automation.PSCredential]$SqlCredential,
-        [int]$RecommendedCostThreshold = 50,
-        [int]$RecommendedMaxDOP        = 4
+        [int]$RecommendedCostThreshold = 50
     )
 
     $result = [PSCustomObject]@{
@@ -1812,9 +1860,10 @@ function Get-SqlParallelismInfo {
         MaxDOPConfigured         = $null
         MaxDOPRunning            = $null
         RecommendedCostThreshold = $RecommendedCostThreshold
-        RecommendedMaxDOP        = $RecommendedMaxDOP
         CostThresholdOk          = $false
-        MaxDOPOk                 = $false
+        MaxDOPStatus             = 'ActionRequired'   # 'ActionRequired' | 'Verify'
+        SqlVersion               = 'Unknown'
+        SqlMajorVersion          = $null
         Error                    = $null
     }
 
@@ -1852,6 +1901,25 @@ function Get-SqlParallelismInfo {
 
         $conn = New-ArSqlConnection -SqlServer $sqlAlias -SqlCredential $SqlCredential
 
+        # SQL Server version drives the MaxDOP = 0 evaluation: 2019 (15.x) and
+        # later auto-detect a recommended MaxDOP during setup, while 2017 (14.x)
+        # and earlier default to 0 (unlimited)
+        try {
+            $verCmd = $conn.CreateCommand()
+            $verCmd.CommandText = "SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128))"
+            $productVersion = [string]$verCmd.ExecuteScalar()
+            if ($productVersion) {
+                $result.SqlVersion = $productVersion
+                $major = 0
+                if ([int]::TryParse(($productVersion -split '\.')[0], [ref]$major)) {
+                    $result.SqlMajorVersion = $major
+                }
+            }
+        }
+        catch {
+            Write-Log "Could not retrieve SQL Server version: $($_.Exception.Message)" -Level "WARN"
+        }
+
         $query = @"
 SELECT name, value, value_in_use
 FROM sys.configurations
@@ -1880,9 +1948,20 @@ WHERE name IN ('cost threshold for parallelism', 'max degree of parallelism')
 
         $result.Checked         = $true
         $result.CostThresholdOk = ($null -ne $result.CostThresholdRunning -and $result.CostThresholdRunning -ge $RecommendedCostThreshold)
-        $result.MaxDOPOk        = ($null -ne $result.MaxDOPRunning -and $result.MaxDOPRunning -eq $RecommendedMaxDOP)
+        # MaxDOP = 0 (unlimited parallelism) is an error on every SQL version:
+        # on SQL 2017 (14.x) and earlier it is the engine default; on SQL 2019
+        # (15.x)+ setup auto-detects a recommended value, so 0 means the value
+        # was overridden after installation. Non-zero values get 'Verify' and
+        # must be confirmed against the KB 4383609 script output. The SQL
+        # version is kept on the result to tailor the report explanation.
+        if ($null -eq $result.MaxDOPRunning -or $result.MaxDOPRunning -eq 0) {
+            $result.MaxDOPStatus = 'ActionRequired'
+        }
+        else {
+            $result.MaxDOPStatus = 'Verify'
+        }
 
-        Write-Log "SQL parallelism on '$sqlAlias': CostThreshold(running)=$($result.CostThresholdRunning) (recommended >= $RecommendedCostThreshold), MaxDOP(running)=$($result.MaxDOPRunning) (recommended = $RecommendedMaxDOP)"
+        Write-Log "SQL parallelism on '$sqlAlias' (SQL version $($result.SqlVersion)): CostThreshold(running)=$($result.CostThresholdRunning) (recommended >= $RecommendedCostThreshold), MaxDOP(running)=$($result.MaxDOPRunning) (status: $($result.MaxDOPStatus); confirm via KB 4383609 script output)"
     }
     catch {
         Write-Log "SQL parallelism check failed: $($_.Exception.Message)" -Level "WARN"
@@ -2191,8 +2270,8 @@ function New-HtmlReport {
           <td style="text-align:right;font-weight:600">$($d.Count)</td>
           <td style="text-align:right">$($d.Percentage)%</td>
           <td style="width:40%">
-            <div style="background:#e5e7eb;border-radius:4px;height:10px;overflow:hidden">
-              <div style="background:#7c3aed;height:100%;width:${barWidth}%"></div>
+            <div style="background:#dce3e5;border-radius:4px;height:10px;overflow:hidden">
+              <div style="background:#3f2c69;height:100%;width:${barWidth}%"></div>
             </div>
           </td>
         </tr>
@@ -2252,14 +2331,14 @@ function New-HtmlReport {
             } else {
                 '<span class="badge badge-green">OK</span>'
             }
-            $barColor = if ($isExpensive) { '#dc2626' } else { '#16a34a' }
+            $barColor = if ($isExpensive) { '#fb4f14' } else { '#77c8b3' }
             $dgExpRows += @"
         <tr>
           <td>$($e.Name)</td>
           <td class="dn-cell">$($e.DN)</td>
           <td style="text-align:right;font-weight:600">$($e.Length)</td>
           <td style="width:22%">
-            <div style="background:#e5e7eb;border-radius:4px;height:10px;overflow:hidden">
+            <div style="background:#dce3e5;border-radius:4px;height:10px;overflow:hidden">
               <div style="background:$barColor;height:100%;width:${barWidth}%"></div>
             </div>
           </td>
@@ -2412,6 +2491,22 @@ function New-HtmlReport {
     $alwaysOnChecked = $AlwaysOnInfo.Checked
     $alwaysOnEnabled = $AlwaysOnInfo.AlwaysOnEnabled
     $multiSubnetOk   = $AlwaysOnInfo.MultiSubnetFailover
+    # SQL Parallelism KPI: red = Cost Threshold below baseline or MaxDOP = 0
+    # (unlimited; flagged on every SQL version);
+    # amber = settings in place but MaxDOP must be verified against the KB 4383609 script output
+    if (-not $SqlParallelismInfo.Checked) {
+        $sqlParKpiColor = 'slate'; $sqlParKpiValue = 'N/A'
+        $sqlParKpiBadgeClass = 'badge-gray'; $sqlParKpiBadgeText = 'Not Checked'
+    }
+    elseif (-not $SqlParallelismInfo.CostThresholdOk -or $SqlParallelismInfo.MaxDOPStatus -eq 'ActionRequired') {
+        $sqlParKpiColor = 'red'; $sqlParKpiValue = 'Review'
+        $sqlParKpiBadgeClass = 'badge-red'; $sqlParKpiBadgeText = 'Action Required'
+    }
+    else {
+        $sqlParKpiColor = 'amber'; $sqlParKpiValue = 'Verify'
+        $sqlParKpiBadgeClass = 'badge-amber'; $sqlParKpiBadgeText = 'Verify MaxDOP'
+    }
+    $verboseLoggingCount = $Servers.VerboseLoggingCount
 
     $dgBrokenBadge = if ($DynamicGroups.BrokenCount -gt 0) { "badge-red" } else { "badge-green" }
     $muBrokenBadge = if ($ManagedUnits.BrokenCount   -gt 0) { "badge-red" } else { "badge-green" }
@@ -2425,65 +2520,72 @@ function New-HtmlReport {
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Active Roles Environment Assessment - $($OSInfo.ComputerName)</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
+/* One Identity brand palette: Blue #04aada, Black #162c36, Gray #40535d,
+   Monte Carlo #77c8b3, Jaffa #ee8a54, Nepal #82a7c5, Jacarta #3f2c69,
+   Loblolly #cad4d7, Blue Lagoon #00969f, Quest Orange #fb4f14, Pear #cddb28 */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#f0f2f5;color:#1a1a2e;line-height:1.5;font-size:14px}
+body{font-family:'Noto Sans',Verdana,'Segoe UI',system-ui,sans-serif;background:#edf1f2;color:#162c36;line-height:1.5;font-size:14px}
 .page{max-width:1400px;margin:0 auto;padding:24px}
 /* Header */
-.rpt-header{background:linear-gradient(135deg,#1a1a2e 0%,#16213e 55%,#0f3460 100%);border-radius:16px;padding:32px 36px;margin-bottom:24px;color:#fff}
+.rpt-header{background:linear-gradient(135deg,#162c36 0%,#27424f 55%,#40535d 100%);border-bottom:4px solid #04aada;border-radius:16px;padding:32px 36px;margin-bottom:24px;color:#fff}
+.rpt-header .oi-logo{height:36px;width:auto;display:block;margin-bottom:18px}
 .rpt-header h1{font-size:1.75rem;font-weight:700;margin-bottom:6px;letter-spacing:-.3px}
 .rpt-header .meta{display:flex;flex-wrap:wrap;gap:20px;margin-top:14px;font-size:.83rem;opacity:.85}
 .rpt-header .meta span{display:flex;align-items:center;gap:6px}
 .rpt-header .meta strong{opacity:1}
 /* Section titles */
-.sec-title{font-size:1rem;font-weight:700;color:#111827;margin:28px 0 12px;padding-bottom:8px;border-bottom:2px solid #e5e7eb;display:flex;align-items:center;gap:10px}
-.sec-icon{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;background:#2563eb;color:#fff;border-radius:5px;font-size:.68rem;font-weight:800;flex-shrink:0}
+.sec-title{font-size:1rem;font-weight:700;color:#162c36;margin:28px 0 12px;padding-bottom:8px;border-bottom:2px solid #dce3e5;display:flex;align-items:center;gap:10px}
+.sec-icon{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;background:#04aada;color:#fff;border-radius:5px;font-size:.68rem;font-weight:800;flex-shrink:0}
 /* KPI grid */
 .kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:4px}
 .kpi{background:#fff;border-radius:12px;padding:18px 16px;box-shadow:0 1px 3px rgba(0,0,0,.08);transition:transform .15s,box-shadow .15s}
 .kpi:hover{transform:translateY(-2px);box-shadow:0 4px 14px rgba(0,0,0,.11)}
 .kpi[data-section]{cursor:pointer}
 .sec-title[id]{scroll-margin-top:16px}
-.kpi .lbl{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:#6b7280;margin-bottom:5px}
+.kpi .lbl{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:#5d7079;margin-bottom:5px}
 .kpi .val{font-size:1.85rem;font-weight:700;line-height:1}
-.kpi .sub{font-size:.73rem;color:#9ca3af;margin-top:4px}
-.kpi.blue .val{color:#2563eb}.kpi.green .val{color:#16a34a}.kpi.red .val{color:#dc2626}
-.kpi.amber .val{color:#d97706}.kpi.purple .val{color:#7c3aed}.kpi.teal .val{color:#0d9488}
-.kpi.pink .val{color:#db2777}.kpi.slate .val{color:#475569}
+.kpi .sub{font-size:.73rem;color:#94a4ab;margin-top:4px}
+.kpi.blue .val{color:#0079a1}.kpi.green .val{color:#2e8c74}.kpi.red .val{color:#fb4f14}
+.kpi.amber .val{color:#cf6a2e}.kpi.purple .val{color:#3f2c69}.kpi.teal .val{color:#00969f}
+.kpi.pink .val{color:#5b80a5}.kpi.slate .val{color:#40535d}
 /* Panels */
 .panel-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:18px;margin-bottom:4px}
 .panel{background:#fff;border-radius:12px;padding:22px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
 .panel-full{grid-column:1/-1}
-.panel h2{font-size:.92rem;font-weight:600;color:#374151;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid #f0f0f0;display:flex;align-items:center;gap:8px}
+.panel h2{font-size:.92rem;font-weight:600;color:#2f4350;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid #e7edee;display:flex;align-items:center;gap:8px}
 /* Info key-value grid */
 .kv{display:grid;grid-template-columns:auto 1fr;gap:3px 16px}
-.kv .k{font-size:.8rem;font-weight:600;color:#6b7280;padding:4px 0;white-space:nowrap}
-.kv .v{font-size:.8rem;color:#111827;padding:4px 0;word-break:break-word}
+.kv .k{font-size:.8rem;font-weight:600;color:#5d7079;padding:4px 0;white-space:nowrap}
+.kv .v{font-size:.8rem;color:#162c36;padding:4px 0;word-break:break-word}
 /* Tables */
 table{width:100%;border-collapse:collapse;font-size:.82rem}
-thead th{text-align:left;padding:9px 12px;background:#f9fafb;font-weight:600;color:#4b5563;border-bottom:2px solid #e5e7eb;white-space:nowrap}
-tbody td{padding:8px 12px;border-bottom:1px solid #f3f4f6;vertical-align:top}
+thead th{text-align:left;padding:9px 12px;background:#f4f7f8;font-weight:600;color:#40535d;border-bottom:2px solid #dce3e5;white-space:nowrap}
+tbody td{padding:8px 12px;border-bottom:1px solid #eef2f3;vertical-align:top}
 tbody tr:last-child td{border-bottom:none}
-tbody tr:hover{background:#f8fafc}
-.dn-cell{font-size:.75rem;color:#6b7280;word-break:break-all}
-.empty-row{text-align:center;color:#9ca3af;font-style:italic;padding:16px}
+tbody tr:hover{background:#f5f8f9}
+.dn-cell{font-size:.75rem;color:#5d7079;word-break:break-all}
+.empty-row{text-align:center;color:#94a4ab;font-style:italic;padding:16px}
 /* Badges */
 .badge{display:inline-flex;align-items:center;padding:2px 10px;border-radius:9999px;font-size:.74rem;font-weight:600;line-height:1.6}
-.badge-blue{background:#dbeafe;color:#1d4ed8}.badge-green{background:#dcfce7;color:#166534}
-.badge-red{background:#fee2e2;color:#991b1b}.badge-amber{background:#fef3c7;color:#92400e}.badge-gray{background:#f3f4f6;color:#4b5563}
+.badge-blue{background:#d9f1fa;color:#026d92}.badge-green{background:#e3f2ed;color:#1f6e5a}
+.badge-red{background:#fee7dd;color:#b8390e}.badge-amber{background:#fdeee4;color:#a8511f}.badge-gray{background:#eef2f3;color:#40535d}
 /* Type pill */
-.type-pill{font-size:.73rem;background:#f3f4f6;color:#4b5563;padding:2px 8px;border-radius:4px}
+.type-pill{font-size:.73rem;background:#eef2f3;color:#40535d;padding:2px 8px;border-radius:4px}
 /* Alert / status boxes */
-.alert-box{background:#fef3c7;border:1px solid #fcd34d;border-radius:8px;padding:11px 15px;margin-bottom:14px;font-size:.83rem;color:#78350f}
-.ok-note{color:#166534;font-size:.83rem;padding:10px 0;display:flex;align-items:center;gap:6px}
-.skipped-note{color:#6b7280;font-size:.83rem;padding:10px 0;font-style:italic}
+.alert-box{background:#fdeee4;border:1px solid #f5b78d;border-radius:8px;padding:11px 15px;margin-bottom:14px;font-size:.83rem;color:#8c4a23}
+.ok-note{color:#1f6e5a;font-size:.83rem;padding:10px 0;display:flex;align-items:center;gap:6px}
+.skipped-note{color:#5d7079;font-size:.83rem;padding:10px 0;font-style:italic}
 /* Chart wrappers */
 .chart-wrap{position:relative;width:100%;height:240px}
 /* Misc */
-.muted{color:#9ca3af;font-style:italic}
-code{background:#f3f4f6;padding:1px 5px;border-radius:4px;font-size:.82rem}
+.muted{color:#94a4ab;font-style:italic}
+code{background:#eef2f3;padding:1px 5px;border-radius:4px;font-size:.82rem}
 /* Footer */
-.footer{text-align:center;padding:24px;font-size:.73rem;color:#9ca3af;margin-top:12px}
+.footer{text-align:center;padding:24px;font-size:.73rem;color:#94a4ab;margin-top:12px}
 /* Responsive */
 @media(max-width:768px){
   .page{padding:12px}.panel-grid{grid-template-columns:1fr}
@@ -2500,6 +2602,7 @@ code{background:#f3f4f6;padding:1px 5px;border-radius:4px;font-size:.82rem}
 
 <!-- =========================== HEADER =================================== -->
 <div class="rpt-header">
+  <svg class="oi-logo" role="img" aria-label="One Identity" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 413.64 72.9986"><defs><style>.oi-lg1{fill:#ffffff;}.oi-lg2{fill:#04aada;}</style></defs><path class="oi-lg2" d="M64.773,17.9531c0-.5766.5189-1.0377,1.0952-1.0377h.8644c.577,0,.9803.4033,1.4414.8648l22.1357,21.2713h.0578v-20.4642c0-.5763.4615-1.0952,1.0955-1.0952h6.9176c.5763,0,1.0952.5189,1.0952,1.0952v38.7952c0,.6918-.5189,1.0381-1.0952,1.0381h-.5766c-.5767,0-.98-.1733-1.4411-.6341l-22.4242-22.5397h-.0574v21.5016c0,.5766-.4611,1.0955-1.0955,1.0955h-6.8598c-.5767,0-1.0952-.5189-1.0952-1.0955l-.0578-38.7952"/><path class="oi-lg2" d="M106.4504,18.5872c0-.5763.4614-1.0952,1.0951-1.0952h23.8653c.6341,0,1.0952.5189,1.0952,1.0952v6.2835c0,.5767-.4611,1.0952-1.0952,1.0952h-15.9677v7.1479h13.143c.5767,0,1.0955.5189,1.0955,1.0955v6.2832c0,.6341-.5189,1.0952-1.0955,1.0952h-13.143v7.782h15.9677c.6341,0,1.0952.5189,1.0952,1.0955v6.2832c0,.5767-.4611,1.0955-1.0952,1.0955h-23.8653c-.6337,0-1.0951-.5189-1.0951-1.0955V18.5872"/><path class="oi-lg1" d="M161.213,18.4456c0-.5766.5189-1.0955,1.0955-1.0955h6.9172c.5766,0,1.0955.5189,1.0955,1.0955v38.1612c0,.5767-.5189,1.0952-1.0955,1.0952h-6.9172c-.5767,0-1.0955-.5185-1.0955-1.0952V18.4456"/><path class="oi-lg1" d="M177.6537,18.4456c0-.5767.4611-1.0955,1.0374-1.0955h14.0659c11.1252,0,20.2331,9.0501,20.2331,20.1183,0,11.183-9.1079,20.2335-20.2331,20.2335h-14.0659c-.5763,0-1.0374-.5185-1.0374-1.0952V18.4456M192.6992,49.1707c6.5139,0,10.7223-5.1306,10.7223-11.7023,0-6.5143-4.2084-11.6445-10.7223-11.6445h-6.0528v23.3468h6.0528Z"/><path class="oi-lg1" d="M219.1502,18.4456c0-.5766.4614-1.0955,1.0955-1.0955h23.8649c.6341,0,1.0955.5189,1.0955,1.0955v6.2832c0,.5767-.4614,1.0952-1.0955,1.0952h-15.9677v7.1483h13.1433c.5766,0,1.0951.5185,1.0951,1.0952v6.2832c0,.6344-.5185,1.0955-1.0951,1.0955h-13.1433v7.782h15.9677c.6341,0,1.0955.5189,1.0955,1.0952v6.2835c0,.5767-.4614,1.0952-1.0955,1.0952h-23.8649c-.6341,0-1.0955-.5185-1.0955-1.0952V18.4456"/><path class="oi-lg1" d="M251.3532,17.8116c0-.5766.5189-1.0381,1.0948-1.0381h.8651c.5759,0,.9796.4037,1.4407.8648l22.136,21.2713h.0578v-20.4639c0-.5766.4607-1.0955,1.0955-1.0955h6.919c.5741,0,1.0941.5189,1.0941,1.0955v38.7952c0,.6918-.52,1.0378-1.0941,1.0378h-.5777c-.5777,0-.9821-.173-1.4407-.6341l-22.4253-22.5397h-.0574v21.502c0,.5766-.4615,1.0952-1.0955,1.0952h-6.8598c-.5763,0-1.0951-.5185-1.0951-1.0952l-.0574-38.7952"/><path class="oi-lg1" d="M302.8971,25.824h-8.2435c-.6355,0-1.0977-.5185-1.0977-1.0952v-6.2832c0-.5766.4622-1.0955,1.0977-1.0955h25.5934c.6355,0,1.0977.5189,1.0977,1.0955v6.2832c0,.5767-.4622,1.0952-1.0977,1.0952h-8.2435v30.7829c0,.5766-.5164,1.0952-1.0941,1.0952h-6.9183c-.5777,0-1.094-.5185-1.094-1.0952v-30.7829"/><path class="oi-lg1" d="M328.8443,18.4456c0-.5766.5199-1.0955,1.0977-1.0955h6.9147c.5777,0,1.0977.5189,1.0977,1.0955v38.1612c0,.5767-.52,1.0952-1.0977,1.0952h-6.9147c-.5777,0-1.0977-.5185-1.0977-1.0952V18.4456"/><path class="oi-lg1" d="M354.4341,25.824h-8.2399c-.6355,0-1.0977-.5185-1.0977-1.0952v-6.2832c0-.5766.4622-1.0955,1.0977-1.0955h25.5934c.6319,0,1.0941.5189,1.0941,1.0955v6.2832c0,.5767-.4622,1.0952-1.0941,1.0952h-8.2435v30.7829c0,.5766-.52,1.0952-1.0977,1.0952h-6.9147c-.5777,0-1.0977-.5185-1.0977-1.0952v-30.7829"/><path class="oi-lg1" d="M390.7769,38.3456l-12.7389-19.2535c-.4622-.7492,0-1.6714.9243-1.6714h7.4924c.4622,0,.7511.2878.9208.5185l8.016,11.8174,8.0124-11.8174c.1733-.2307.4008-.5185.9207-.5185h7.4924c.9244,0,1.3866.9222.9244,1.6714l-12.9122,19.1961v18.3888c0,.5767-.52,1.0955-1.0941,1.0955h-6.8605c-.6355,0-1.0977-.5189-1.0977-1.0955v-18.3313"/><path class="oi-lg2" d="M52.8247,64.3657c-9.9817,5.8608-22.3326,5.9512-32.3993.2369-10.0667-5.7143-16.3199-16.3649-16.4045-27.9399l-3.5996.0263c.094,12.861,7.042,24.6953,18.2272,31.0446,11.1852,6.349,24.9077,6.2489,35.9993-.2632l-1.823-3.1046Z"/><path class="oi-lg2" d="M20.0158,8.4858h0c9.9817-5.8608,22.3322-5.9511,32.3989-.2369l1.777-3.1309c-11.1848-6.349-24.9077-6.2489-35.9989.2632h0C7.1019,11.8932.327,23.8276.4214,36.6889l3.5996-.0263c-.0842-11.5751,6.0124-22.316,15.9948-28.1768Z"/><path class="oi-lg2" d="M36.4203,7.6258c10.2892,0,19.7968,5.4893,24.9415,14.4l-3.1176,1.8c-4.5018-7.7969-12.8207-12.6-21.8239-12.6v-3.6"/><path class="oi-lg2" d="M61.3618,50.8257l-3.1176-1.8c-4.5018,7.7969-12.8206,12.6-21.8239,12.6s-17.3221-4.8031-21.8239-12.6l-3.1176,1.8c5.1447,8.9107,14.6523,14.4,24.9415,14.4h0c10.2892,0,19.7967-5.4893,24.9415-14.4Z"/><path class="oi-lg2" d="M14.5963,23.8257l-3.1176-1.8c-5.1447,8.9107-5.1447,19.8893,0,28.8l3.1176-1.8c-4.5014-7.7969-4.5014-17.4031,0-25.2Z"/><path class="oi-lg2" d="M36.4203,14.8258c7.7166,0,14.8475,4.117,18.706,10.8,3.8588,6.683,3.8588,14.917,0,21.6-3.8585,6.683-10.9894,10.8-18.706,10.8s-14.8478-4.117-18.7063-10.8c-3.8585-6.683-3.8585-14.917,0-21.6,3.8585-6.683,10.989-10.8,18.7063-10.8M25.5079,30.1258c-2.2507,3.8984-2.2507,8.7016,0,12.6,2.2511,3.8984,6.4105,6.3,10.9123,6.3s8.6612-2.4016,10.9116-6.3c2.2507-3.8984,2.2507-8.7016,0-12.6-2.2504-3.8984-6.4102-6.3-10.9116-6.3s-8.6612,2.4016-10.9123,6.3Z"/></svg>
   <h1>Active Roles Environment Assessment</h1>
   <div class="meta">
     <span>&#128421; Server: <strong>$($OSInfo.ComputerName)</strong></span>
@@ -2561,6 +2664,18 @@ $(if (-not $AzureTenants.Skipped) {@"
     <div class="val" style="font-size:1.1rem;padding-top:4px">$(if($alwaysOnChecked){if($alwaysOnEnabled){'Enabled'}else{'Not Enabled'}}else{'N/A'})</div>
     <div class="sub"><span class="badge $(if($alwaysOnChecked){if($alwaysOnEnabled){if($multiSubnetOk){'badge-green'}else{'badge-red'}}else{'badge-gray'}}else{'badge-gray'})">$(if($alwaysOnChecked){if($alwaysOnEnabled){if($multiSubnetOk){'MultiSubnet OK'}else{'Action Required'}}else{'N/A'}}else{'Not Checked'})</span></div>
   </div>
+  <div class="kpi $sqlParKpiColor" data-section="sec-sqlpar" onclick="document.getElementById(this.dataset.section).scrollIntoView({behavior:'smooth'})">
+    <div class="lbl">SQL Parallelism</div>
+    <div class="val" style="font-size:1.1rem;padding-top:4px">$sqlParKpiValue</div>
+    <div class="sub"><span class="badge $sqlParKpiBadgeClass">$sqlParKpiBadgeText</span></div>
+  </div>
+$(if ($verboseLoggingCount -gt 0) {@"
+  <div class="kpi red" data-section="sec-servers" onclick="document.getElementById(this.dataset.section).scrollIntoView({behavior:'smooth'})">
+    <div class="lbl">Verbose Logging</div>
+    <div class="val" style="font-size:1.1rem;padding-top:4px">Enabled</div>
+    <div class="sub"><span class="badge badge-red">$verboseLoggingCount instance(s)</span></div>
+  </div>
+"@})
   <div class="kpi purple" data-section="sec-dyngroups" onclick="document.getElementById(this.dataset.section).scrollIntoView({behavior:'smooth'})">
     <div class="lbl">Dynamic Groups</div>
     <div class="val">$(Format-Count $DynamicGroups.TotalCount)</div>
@@ -2644,7 +2759,7 @@ $(if ($ManagedUserCounts.Skipped) {@"
 "@} else {@"
 <div class="panel" style="margin-top:20px">
   <h2>Managed Users &nbsp;<span class="badge badge-blue">$(Format-Count $safeTotalUsers) total</span></h2>
-  <p style="font-size:.82rem;color:#6b7280;margin-bottom:14px">
+  <p style="font-size:.82rem;color:#5d7079;margin-bottom:14px">
     User count per domain, excluding OUs and Managed Units linked to <em>Built-in Policy &ndash; Exclude from Managed Scope</em>$(
         $exParts = @()
         if ($ManagedUserCounts.ExcludedOUs.Count -gt 0) { $exParts += "$($ManagedUserCounts.ExcludedOUs.Count) OU(s)" }
@@ -2668,15 +2783,23 @@ $(($ManagedUserCounts.PerDomain | ForEach-Object {
 }) -join "`n")
     </tbody>
     <tfoot>
-      <tr style="border-top:2px solid #e5e7eb;font-weight:700"><td>Subtotal (AD)</td><td style="text-align:right">$(Format-Count $safeTotalUsers)</td><td style="text-align:right">$(Format-Count $safeDisabledTotal)</td><td style="text-align:right">$(Format-Count $safeOnPremTotal)</td><td style="text-align:right">$(Format-Count $safeHybridTotal)</td><td style="text-align:right">$(Format-Count $safeGmsaTotal)</td><td style="text-align:right">$(Format-Count $safeExcludedTotal)</td></tr>
+      <tr style="border-top:2px solid #dce3e5;font-weight:700"><td>Subtotal (AD)</td><td style="text-align:right">$(Format-Count $safeTotalUsers)</td><td style="text-align:right">$(Format-Count $safeDisabledTotal)</td><td style="text-align:right">$(Format-Count $safeOnPremTotal)</td><td style="text-align:right">$(Format-Count $safeHybridTotal)</td><td style="text-align:right">$(Format-Count $safeGmsaTotal)</td><td style="text-align:right">$(Format-Count $safeExcludedTotal)</td></tr>
     </tfoot>
   </table>
   </div>
 $(if ($ManagedUserCounts.ExcludedOUs.Count -gt 0) {@"
   <details style="margin-top:12px">
-    <summary style="font-size:.82rem;color:#6b7280;cursor:pointer">Excluded OUs ($($ManagedUserCounts.ExcludedOUs.Count))</summary>
-    <ul style="font-size:.78rem;color:#9ca3af;margin-top:6px;padding-left:18px">
+    <summary style="font-size:.82rem;color:#5d7079;cursor:pointer">Excluded OUs ($($ManagedUserCounts.ExcludedOUs.Count))</summary>
+    <ul style="font-size:.78rem;color:#94a4ab;margin-top:6px;padding-left:18px">
 $(($ManagedUserCounts.ExcludedOUs | ForEach-Object { "      <li style='word-break:break-all'>$(ConvertTo-SafeHtml $_)</li>" }) -join "`n")
+    </ul>
+  </details>
+"@})
+$(if ($ManagedUserCounts.ExcludedMUs.Count -gt 0) {@"
+  <details style="margin-top:12px">
+    <summary style="font-size:.82rem;color:#5d7079;cursor:pointer">Excluded Managed Units ($($ManagedUserCounts.ExcludedMUs.Count))</summary>
+    <ul style="font-size:.78rem;color:#94a4ab;margin-top:6px;padding-left:18px">
+$(($ManagedUserCounts.ExcludedMUs | ForEach-Object { "      <li style='word-break:break-all'>$(ConvertTo-SafeHtml $_)</li>" }) -join "`n")
     </ul>
   </details>
 "@})
@@ -2727,17 +2850,17 @@ $(if ($exchangePresent) {@"
   </table>
   </div>
 $(if (-not $perfFlagOk) {@"
-  <div style="margin-top:16px;padding:16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;">
-    <strong style="color:#92400e">&#9888; PerformanceFlag Registry Key Not Configured</strong>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+  <div style="margin-top:16px;padding:16px;background:#fdeee4;border:1px solid #ee8a54;border-radius:8px;">
+    <strong style="color:#a8511f">&#9888; PerformanceFlag Registry Key Not Configured</strong>
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
       Exchange has been detected but the <code style="background:#fff;padding:2px 6px;border-radius:4px;font-weight:600">PerformanceFlag</code> DWORD registry value is not set to <strong>1</strong> at:
     </p>
-    <p style="margin-top:4px;font-family:monospace;font-size:0.85rem;color:#78350f;padding-left:12px">
+    <p style="margin-top:4px;font-family:monospace;font-size:0.85rem;color:#8c4a23;padding-left:12px">
       HKEY_LOCAL_MACHINE\SOFTWARE\One Identity\Active Roles\Configuration
     </p>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
       This registry key is required for optimal Active Roles performance when Exchange is present.
-      Please refer to KB article <a href="https://support.oneidentity.com/kb/4336544/" target="_blank" rel="noopener" style="color:#1d4ed8;font-weight:600">KB 4336544</a> for configuration instructions.
+      Please refer to KB article <a href="https://support.oneidentity.com/kb/4336544/" target="_blank" rel="noopener" style="color:#026d92;font-weight:600">KB 4336544</a> for configuration instructions.
     </p>
   </div>
 "@})
@@ -2754,23 +2877,23 @@ $(if (-not $perfFlagOk) {@"
 $(if ($disable500VA) {@"
 <div class="panel">
   <h2>Disable500VA &nbsp;<span class="badge badge-green">Configured (Value = 1)</span></h2>
-  <p style="font-size:0.9rem;color:#374151">The <code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-weight:600">Disable500VA</code> DWORD registry key is correctly set to <strong>1</strong> at:</p>
-  <p style="margin-top:4px;font-family:monospace;font-size:0.85rem;color:#4b5563;padding-left:12px">HKEY_LOCAL_MACHINE\SOFTWARE\One Identity\Active Roles\Configuration\Service</p>
+  <p style="font-size:0.9rem;color:#2f4350">The <code style="background:#eef2f3;padding:2px 6px;border-radius:4px;font-weight:600">Disable500VA</code> DWORD registry key is correctly set to <strong>1</strong> at:</p>
+  <p style="margin-top:4px;font-family:monospace;font-size:0.85rem;color:#40535d;padding-left:12px">HKEY_LOCAL_MACHINE\SOFTWARE\One Identity\Active Roles\Configuration\Service</p>
 </div>
 "@} else {@"
 <div class="panel">
   <h2>Disable500VA &nbsp;<span class="badge badge-red">Not Configured</span></h2>
-  <div style="margin-top:8px;padding:16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;">
-    <strong style="color:#92400e">&#9888; Disable500VA Registry Key Not Configured</strong>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+  <div style="margin-top:8px;padding:16px;background:#fdeee4;border:1px solid #ee8a54;border-radius:8px;">
+    <strong style="color:#a8511f">&#9888; Disable500VA Registry Key Not Configured</strong>
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
       The <code style="background:#fff;padding:2px 6px;border-radius:4px;font-weight:600">Disable500VA</code> 32-bit DWORD registry value is missing or not set to <strong>1</strong> at:
     </p>
-    <p style="margin-top:4px;font-family:monospace;font-size:0.85rem;color:#78350f;padding-left:12px">
+    <p style="margin-top:4px;font-family:monospace;font-size:0.85rem;color:#8c4a23;padding-left:12px">
       HKEY_LOCAL_MACHINE\SOFTWARE\One Identity\Active Roles\Configuration\Service
     </p>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
       This registry key should be configured for proper Active Roles operation.
-      Please refer to KB article <a href="https://support.oneidentity.com/kb/4216183" target="_blank" rel="noopener" style="color:#1d4ed8;font-weight:600">KB 4216183</a> for details and configuration instructions.
+      Please refer to KB article <a href="https://support.oneidentity.com/kb/4216183" target="_blank" rel="noopener" style="color:#026d92;font-weight:600">KB 4216183</a> for details and configuration instructions.
     </p>
   </div>
 </div>
@@ -2818,30 +2941,30 @@ $(if ($autoShrinkChecked) {
     if ($autoShrinkOn) {@"
 <div class="panel">
   <h2>Auto Shrink &nbsp;<span class="badge badge-red">Enabled</span></h2>
-  <div style="margin-top:8px;padding:16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;">
-    <strong style="color:#92400e">&#9888; Auto Shrink is Enabled on the Configuration Database</strong>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+  <div style="margin-top:8px;padding:16px;background:#fdeee4;border:1px solid #ee8a54;border-radius:8px;">
+    <strong style="color:#a8511f">&#9888; Auto Shrink is Enabled on the Configuration Database</strong>
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
       Database <code style="background:#fff;padding:2px 6px;border-radius:4px;font-weight:600">$($AutoShrinkInfo.DatabaseName)</code>
       on SQL Server <code style="background:#fff;padding:2px 6px;border-radius:4px;font-weight:600">$($AutoShrinkInfo.SqlServer)</code>
       has <strong>is_auto_shrink_on = 1</strong>.
     </p>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
       Auto Shrink should be <strong>disabled</strong> on Active Roles databases to avoid unnecessary I/O overhead, index fragmentation, and potential performance degradation.
     </p>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
       To disable, run: <code style="background:#fff;padding:2px 6px;border-radius:4px">ALTER DATABASE [$($AutoShrinkInfo.DatabaseName)] SET AUTO_SHRINK OFF</code>
     </p>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
-      See <a href="https://support.oneidentity.com/kb/4381874" target="_blank" rel="noopener" style="color:#2563eb">KB 4381874</a> for details and additional guidance.
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
+      See <a href="https://support.oneidentity.com/kb/4381874" target="_blank" rel="noopener" style="color:#0079a1">KB 4381874</a> for details and additional guidance.
     </p>
   </div>
 </div>
 "@} else {@"
 <div class="panel">
   <h2>Auto Shrink &nbsp;<span class="badge badge-green">Disabled (OK)</span></h2>
-  <p style="font-size:0.9rem;color:#374151">
-    Database <code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-weight:600">$($AutoShrinkInfo.DatabaseName)</code>
-    on SQL Server <code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-weight:600">$($AutoShrinkInfo.SqlServer)</code>
+  <p style="font-size:0.9rem;color:#2f4350">
+    Database <code style="background:#eef2f3;padding:2px 6px;border-radius:4px;font-weight:600">$($AutoShrinkInfo.DatabaseName)</code>
+    on SQL Server <code style="background:#eef2f3;padding:2px 6px;border-radius:4px;font-weight:600">$($AutoShrinkInfo.SqlServer)</code>
     has Auto Shrink correctly disabled (<strong>is_auto_shrink_on = 0</strong>).
   </p>
 </div>
@@ -2849,8 +2972,8 @@ $(if ($autoShrinkChecked) {
 } else {@"
 <div class="panel">
   <h2>Auto Shrink &nbsp;<span class="badge badge-gray">Not Checked</span></h2>
-  <div style="margin-top:8px;padding:16px;background:#f3f4f6;border:1px solid #d1d5db;border-radius:8px;">
-    <p style="color:#4b5563;font-size:0.9rem">
+  <div style="margin-top:8px;padding:16px;background:#eef2f3;border:1px solid #cad4d7;border-radius:8px;">
+    <p style="color:#40535d;font-size:0.9rem">
       Could not verify Auto Shrink status. $(if ($AutoShrinkInfo.Error) { "Error: $($AutoShrinkInfo.Error)" } else { "The Configuration DB could not be discovered or connected to." })
     </p>
   </div>
@@ -2864,8 +2987,8 @@ $(if ($alwaysOnChecked) {
         if ($multiSubnetOk -eq $true) {@"
 <div class="panel">
   <h2>AlwaysOn &nbsp;<span class="badge badge-green">Enabled</span> &nbsp; MultiSubnetFailover &nbsp;<span class="badge badge-green">Enabled (OK)</span></h2>
-  <p style="font-size:0.9rem;color:#374151">
-    SQL Server <code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-weight:600">$($AlwaysOnInfo.SqlServer)</code>
+  <p style="font-size:0.9rem;color:#2f4350">
+    SQL Server <code style="background:#eef2f3;padding:2px 6px;border-radius:4px;font-weight:600">$($AlwaysOnInfo.SqlServer)</code>
     has AlwaysOn Availability Groups enabled and the Active Roles
     <strong>MultiSubnetFailoverSupport</strong> setting is correctly configured.
   </p>
@@ -2873,41 +2996,41 @@ $(if ($alwaysOnChecked) {
 "@} elseif ($multiSubnetOk -eq $false) {@"
 <div class="panel">
   <h2>AlwaysOn &nbsp;<span class="badge badge-green">Enabled</span> &nbsp; MultiSubnetFailover &nbsp;<span class="badge badge-red">Not Enabled</span></h2>
-  <div style="margin-top:8px;padding:16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;">
-    <strong style="color:#92400e">&#9888; MultiSubnetFailoverSupport is Not Enabled</strong>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+  <div style="margin-top:8px;padding:16px;background:#fdeee4;border:1px solid #ee8a54;border-radius:8px;">
+    <strong style="color:#a8511f">&#9888; MultiSubnetFailoverSupport is Not Enabled</strong>
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
       SQL Server <code style="background:#fff;padding:2px 6px;border-radius:4px;font-weight:600">$($AlwaysOnInfo.SqlServer)</code>
       has AlwaysOn Availability Groups enabled, but the Active Roles
       <strong>MultiSubnetFailoverSupport</strong> setting is <strong>not enabled</strong>.
     </p>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
       When using SQL Server AlwaysOn, <strong>MultiSubnetFailoverSupport</strong> should be enabled
       in Active Roles to ensure proper failover behavior and faster connection recovery across subnets.
     </p>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
       To verify the current setting, run:
       <code style="background:#fff;padding:2px 6px;border-radius:4px">Get-ARService -IncludeAdvancedDatabaseSettings | fl MultiSubnetFailoverSupport</code>
     </p>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
-      See <a href="https://support.oneidentity.com/kb/4374079" target="_blank" rel="noopener" style="color:#2563eb">KB 4374079</a> for instructions on enabling MultiSubnetFailoverSupport.
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
+      See <a href="https://support.oneidentity.com/kb/4374079" target="_blank" rel="noopener" style="color:#0079a1">KB 4374079</a> for instructions on enabling MultiSubnetFailoverSupport.
     </p>
   </div>
 </div>
 "@} else {@"
 <div class="panel">
   <h2>AlwaysOn &nbsp;<span class="badge badge-green">Enabled</span> &nbsp; MultiSubnetFailover &nbsp;<span class="badge badge-gray">Unknown</span></h2>
-  <div style="margin-top:8px;padding:16px;background:#f3f4f6;border:1px solid #d1d5db;border-radius:8px;">
-    <p style="color:#4b5563;font-size:0.9rem">
+  <div style="margin-top:8px;padding:16px;background:#eef2f3;border:1px solid #cad4d7;border-radius:8px;">
+    <p style="color:#40535d;font-size:0.9rem">
       SQL Server <code style="background:#fff;padding:2px 6px;border-radius:4px;font-weight:600">$($AlwaysOnInfo.SqlServer)</code>
       has AlwaysOn Availability Groups enabled, but the MultiSubnetFailoverSupport setting
       could not be verified.$(if ($AlwaysOnInfo.Error) { " Error: $($AlwaysOnInfo.Error)" })
     </p>
-    <p style="margin-top:8px;color:#4b5563;font-size:0.9rem">
+    <p style="margin-top:8px;color:#40535d;font-size:0.9rem">
       To verify manually, run:
       <code style="background:#fff;padding:2px 6px;border-radius:4px">Get-ARService -IncludeAdvancedDatabaseSettings | fl MultiSubnetFailoverSupport</code>
     </p>
-    <p style="margin-top:8px;color:#4b5563;font-size:0.9rem">
-      See <a href="https://support.oneidentity.com/kb/4374079" target="_blank" rel="noopener" style="color:#2563eb">KB 4374079</a> for details.
+    <p style="margin-top:8px;color:#40535d;font-size:0.9rem">
+      See <a href="https://support.oneidentity.com/kb/4374079" target="_blank" rel="noopener" style="color:#0079a1">KB 4374079</a> for details.
     </p>
   </div>
 </div>
@@ -2915,8 +3038,8 @@ $(if ($alwaysOnChecked) {
     } else {@"
 <div class="panel">
   <h2>AlwaysOn &nbsp;<span class="badge badge-gray">Not Enabled</span></h2>
-  <p style="font-size:0.9rem;color:#374151">
-    SQL Server <code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-weight:600">$($AlwaysOnInfo.SqlServer)</code>
+  <p style="font-size:0.9rem;color:#2f4350">
+    SQL Server <code style="background:#eef2f3;padding:2px 6px;border-radius:4px;font-weight:600">$($AlwaysOnInfo.SqlServer)</code>
     does not have AlwaysOn Availability Groups enabled. MultiSubnetFailoverSupport check is not applicable.
   </p>
 </div>
@@ -2924,8 +3047,8 @@ $(if ($alwaysOnChecked) {
 } else {@"
 <div class="panel">
   <h2>AlwaysOn &nbsp;<span class="badge badge-gray">Not Checked</span></h2>
-  <div style="margin-top:8px;padding:16px;background:#f3f4f6;border:1px solid #d1d5db;border-radius:8px;">
-    <p style="color:#4b5563;font-size:0.9rem">
+  <div style="margin-top:8px;padding:16px;background:#eef2f3;border:1px solid #cad4d7;border-radius:8px;">
+    <p style="color:#40535d;font-size:0.9rem">
       Could not verify AlwaysOn status.$(if ($AlwaysOnInfo.Error) { " Error: $($AlwaysOnInfo.Error)" } else { " The Configuration DB could not be discovered or connected to." })
     </p>
   </div>
@@ -2940,18 +3063,21 @@ $(if ($SqlParallelismInfo.Checked) {
     $maxRunning  = $SqlParallelismInfo.MaxDOPRunning
     $maxConfig   = $SqlParallelismInfo.MaxDOPConfigured
     $recCT       = $SqlParallelismInfo.RecommendedCostThreshold
-    $recMax      = $SqlParallelismInfo.RecommendedMaxDOP
     $ctOk        = $SqlParallelismInfo.CostThresholdOk
-    $maxOk       = $SqlParallelismInfo.MaxDOPOk
-    $ctBadge     = if ($ctOk)  { '<span class="badge badge-green">OK</span>' }  else { '<span class="badge badge-red">Action Required</span>' }
-    $maxBadge    = if ($maxOk) { '<span class="badge badge-green">OK</span>' } else { '<span class="badge badge-red">Action Required</span>' }
-    $allOk       = $ctOk -and $maxOk
+    $maxStatus   = $SqlParallelismInfo.MaxDOPStatus   # 'ActionRequired' (0 on SQL <= 14.x) | 'Verify'
+    $sqlVersion  = $SqlParallelismInfo.SqlVersion
+    $sqlMajor    = $SqlParallelismInfo.SqlMajorVersion
+    $ctBadge     = if ($ctOk)   { '<span class="badge badge-green">OK</span>' }     else { '<span class="badge badge-red">Action Required</span>' }
+    # MaxDOP can never be green: every value still has to be confirmed against the KB 4383609 script output
+    $maxBadge    = if ($maxStatus -eq 'Verify') { '<span class="badge badge-amber">Verify</span>' } else { '<span class="badge badge-red">Action Required</span>' }
+    $actionRequired = (-not $ctOk) -or ($maxStatus -eq 'ActionRequired')
+    $panelBadge  = if ($actionRequired) { '<span class="badge badge-red">Action Required</span>' } else { '<span class="badge badge-amber">Verify</span>' }
 @"
 <div class="panel">
-  <h2>Parallelism &nbsp;$(if($allOk){'<span class="badge badge-green">OK</span>'}else{'<span class="badge badge-red">Action Required</span>'})</h2>
-  <p style="font-size:0.9rem;color:#374151;margin-bottom:12px">
-    SQL Server <code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-weight:600">$($SqlParallelismInfo.SqlServer)</code>
-    parallelism settings compared against One Identity recommendations for Active Roles performance.
+  <h2>Parallelism &nbsp;$panelBadge</h2>
+  <p style="font-size:0.9rem;color:#2f4350;margin-bottom:12px">
+    SQL Server <code style="background:#eef2f3;padding:2px 6px;border-radius:4px;font-weight:600">$($SqlParallelismInfo.SqlServer)</code>
+    $(if ($sqlVersion -and $sqlVersion -ne 'Unknown') { "(version <strong>$sqlVersion</strong>) " })parallelism settings compared against One Identity recommendations for Active Roles performance.
   </p>
   <table>
     <thead><tr><th>Setting</th><th style="text-align:right">Configured</th><th style="text-align:right">Running</th><th style="text-align:right">Recommended</th><th style="text-align:center">Status</th></tr></thead>
@@ -2967,42 +3093,83 @@ $(if ($SqlParallelismInfo.Checked) {
         <td>Max Degree of Parallelism (MaxDOP)</td>
         <td style="text-align:right;font-weight:600">$maxConfig</td>
         <td style="text-align:right;font-weight:600">$maxRunning</td>
-        <td style="text-align:right">$recMax</td>
+        <td style="text-align:right">Per KB 4383609 script output</td>
         <td style="text-align:center">$maxBadge</td>
       </tr>
     </tbody>
   </table>
-$(if (-not $allOk) {@"
-  <div style="margin-top:12px;padding:16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;">
-    <strong style="color:#92400e">&#9888; One or more SQL parallelism settings do not match the recommended values</strong>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+$(if ($actionRequired) {@"
+  <div style="margin-top:12px;padding:16px;background:#fee7dd;border:1px solid #fb4f14;border-radius:8px;">
+    <strong style="color:#b8390e">&#9888; One or more SQL parallelism settings do not match the recommended values</strong>
+    <p style="margin-top:8px;color:#93300c;font-size:0.9rem">
       Engage your SQL Database Administrator (DBA) to review the current parallelism configuration and evaluate
       adjusting these values to One Identity's recommended baseline:
-      <strong>Cost Threshold for Parallelism = $recCT (or higher)</strong> and
-      <strong>Max Degree of Parallelism = $recMax</strong>.
+      <strong>Cost Threshold for Parallelism = $recCT (or higher)</strong>.
     </p>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
+    <p style="margin-top:8px;color:#93300c;font-size:0.9rem">
+      For <strong>Max Degree of Parallelism (MaxDOP)</strong> there is no single recommended value: run the SQL
+      script attached to <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#0079a1">KB 4383609</a>
+      against this instance and set MaxDOP based on the value returned by the script.
+    </p>
+$(if ($maxStatus -eq 'ActionRequired' -and $maxRunning -eq 0) {
+    if ($null -ne $sqlMajor -and $sqlMajor -ge 15) {@"
+    <p style="margin-top:8px;color:#93300c;font-size:0.9rem">
+      This instance runs SQL Server <strong>$sqlVersion</strong> (2019/15.x or later) with
+      <strong>MaxDOP = 0</strong> (unlimited parallelism), which is not recommended for Active Roles.
+      Set it based on the KB 4383609 script output.
+    </p>
+"@} elseif ($null -ne $sqlMajor) {@"
+    <p style="margin-top:8px;color:#93300c;font-size:0.9rem">
+      This instance runs SQL Server <strong>$sqlVersion</strong> (2017/14.x or earlier) with
+      <strong>MaxDOP = 0</strong> &mdash; the Database Engine default on these versions, meaning unlimited
+      parallelism, which is not recommended for Active Roles. Unlike SQL Server 2019 (15.x) and later,
+      these versions do not auto-detect a recommended MaxDOP during setup, so the value must be set manually.
+    </p>
+"@} else {@"
+    <p style="margin-top:8px;color:#93300c;font-size:0.9rem">
+      This instance has <strong>MaxDOP = 0</strong> (unlimited parallelism), which is not recommended for
+      Active Roles. The SQL Server version could not be determined &mdash; set MaxDOP based on the
+      KB 4383609 script output.
+    </p>
+"@}})
+    <p style="margin-top:8px;color:#93300c;font-size:0.9rem">
       Misconfigured parallelism can impact Active Roles query performance, especially under load. Any change
       should be validated against the broader SQL workload on this instance.
     </p>
-    <p style="margin-top:8px;color:#78350f;font-size:0.9rem">
-      See <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#2563eb">KB 4383609</a> &mdash; Recommended SQL settings for Active Roles performance.
+    <p style="margin-top:8px;color:#93300c;font-size:0.9rem">
+      See <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#0079a1">KB 4383609</a> &mdash; Recommended SQL settings for Active Roles performance.
     </p>
   </div>
 "@} else {@"
-  <p class="ok-note" style="margin-top:12px">&#10003; Both parallelism settings match the recommended baseline. See <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#2563eb">KB 4383609</a> for details.</p>
+  <div style="margin-top:12px;padding:16px;background:#fdeee4;border:1px solid #ee8a54;border-radius:8px;">
+    <strong style="color:#a8511f">&#9888; MaxDOP value requires verification</strong>
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
+      Cost Threshold for Parallelism meets the recommended baseline and the current MaxDOP running value is
+      <strong>$maxRunning</strong>. However, this report cannot determine whether this is the correct value
+      for this server's hardware: run the SQL script attached to
+      <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#0079a1">KB 4383609</a>
+      against this instance and confirm that MaxDOP matches the value returned by the script.
+    </p>
+$(if ($null -ne $sqlMajor -and $sqlMajor -ge 15) {@"
+    <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
+      This instance runs SQL Server <strong>$sqlVersion</strong> (2019/15.x or later), which auto-detects a
+      recommended MaxDOP during setup based on the number of cores. Even so, the setup page may have been
+      skipped or the value changed since installation &mdash; confirm it with the KB 4383609 script.
+    </p>
+"@})
+  </div>
 "@})
 </div>
 "@
 } else {@"
 <div class="panel">
   <h2>Parallelism &nbsp;<span class="badge badge-gray">Not Checked</span></h2>
-  <div style="margin-top:8px;padding:16px;background:#f3f4f6;border:1px solid #d1d5db;border-radius:8px;">
-    <p style="color:#4b5563;font-size:0.9rem">
+  <div style="margin-top:8px;padding:16px;background:#eef2f3;border:1px solid #cad4d7;border-radius:8px;">
+    <p style="color:#40535d;font-size:0.9rem">
       Could not verify SQL parallelism settings.$(if ($SqlParallelismInfo.Error) { " Error: $($SqlParallelismInfo.Error)" } else { " The Configuration DB could not be discovered or connected to." })
     </p>
-    <p style="margin-top:8px;color:#4b5563;font-size:0.9rem">
-      See <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#2563eb">KB 4383609</a> &mdash; Recommended SQL settings for Active Roles performance.
+    <p style="margin-top:8px;color:#40535d;font-size:0.9rem">
+      See <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#0079a1">KB 4383609</a> &mdash; Recommended SQL settings for Active Roles performance.
     </p>
   </div>
 </div>
@@ -3036,7 +3203,7 @@ $(if (-not $allOk) {@"
 </div>
 <div class="panel panel-full" style="margin-top:20px">
   <h2>Expensive LDAP Queries &nbsp;<span class="badge badge-blue">Top $($DynamicGroups.ExpensiveShown) of $(Format-Count $DynamicGroups.TotalCount)</span> &nbsp;<span class="badge $(if($DynamicGroups.ExpensiveCount -gt 0){'badge-red'}else{'badge-green'})">$($DynamicGroups.ExpensiveCount) above threshold</span></h2>
-  <p style="font-size:.82rem;color:#6b7280;margin-bottom:12px">
+  <p style="font-size:.82rem;color:#5d7079;margin-bottom:12px">
     Dynamic Groups whose membership produces a large result set (high <code>accountNameHistory</code> length) translate into expensive LDAP queries that can impact both the Active Roles service and the Domain Controllers. Groups with <strong>$($DynamicGroups.ExpensiveThreshold)+</strong> entries are flagged as <em>Expensive</em>.
   </p>
   $dgExpensiveSection
@@ -3091,8 +3258,8 @@ $(if (-not $allOk) {@"
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
       <input type="text" class="search-box" id="wfSearch" placeholder="Search workflows...">
       <div style="display:flex;align-items:center;gap:8px">
-        <label style="font-size:.82rem;color:#6b7280;white-space:nowrap">Show
-          <select id="wfPageSize" onchange="changeWfPageSize(this.value)" style="padding:4px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:.82rem;background:#fff;cursor:pointer">
+        <label style="font-size:.82rem;color:#5d7079;white-space:nowrap">Show
+          <select id="wfPageSize" onchange="changeWfPageSize(this.value)" style="padding:4px 8px;border:1px solid #cad4d7;border-radius:6px;font-size:.82rem;background:#fff;cursor:pointer">
             <option value="10" selected>10</option>
             <option value="25">25</option>
             <option value="50">50</option>
@@ -3139,8 +3306,8 @@ $(if (-not $allOk) {@"
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
       <input type="text" class="search-box" id="poSearch" placeholder="Search policies...">
       <div style="display:flex;align-items:center;gap:8px">
-        <label style="font-size:.82rem;color:#6b7280;white-space:nowrap">Show
-          <select id="poPageSize" onchange="changePoPageSize(this.value)" style="padding:4px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:.82rem;background:#fff;cursor:pointer">
+        <label style="font-size:.82rem;color:#5d7079;white-space:nowrap">Show
+          <select id="poPageSize" onchange="changePoPageSize(this.value)" style="padding:4px 8px;border:1px solid #cad4d7;border-radius:6px;font-size:.82rem;background:#fff;cursor:pointer">
             <option value="10" selected>10</option>
             <option value="25">25</option>
             <option value="50">50</option>
@@ -3157,14 +3324,14 @@ $(if (-not $allOk) {@"
   </div>
 </div>
 $(if ($safeOrphan -gt 0) {@"
-<div class="panel" style="margin-bottom:24px;border-left:4px solid #dc2626">
-  <h2 style="color:#dc2626">Orphan Policy Object Links &nbsp;<span class="badge badge-red">$safeOrphan found</span></h2>
-  <p style="font-size:.85rem;color:#6b7280;margin-bottom:12px">
+<div class="panel" style="margin-bottom:24px;border-left:4px solid #fb4f14">
+  <h2 style="color:#fb4f14">Orphan Policy Object Links &nbsp;<span class="badge badge-red">$safeOrphan found</span></h2>
+  <p style="font-size:.85rem;color:#5d7079;margin-bottom:12px">
     These policy links reference a missing target object or a missing policy object.
     This can occur when objects are deleted without cleaning up their policy links.
     <br><strong>Recommendation:</strong> Review and remove orphan links using PowerShell.
-    See <a href="https://support.oneidentity.com/kb/4338749" target="_blank" rel="noopener" style="color:#2563eb">KB 4338749</a> for removal instructions
-    and <a href="https://support.oneidentity.com/kb/4381874" target="_blank" rel="noopener" style="color:#2563eb">KB 4381874</a> for additional guidance.
+    See <a href="https://support.oneidentity.com/kb/4338749" target="_blank" rel="noopener" style="color:#0079a1">KB 4338749</a> for removal instructions
+    and <a href="https://support.oneidentity.com/kb/4381874" target="_blank" rel="noopener" style="color:#0079a1">KB 4381874</a> for additional guidance.
   </p>
   <div style="display:flex;justify-content:flex-end;margin-bottom:12px">
     <button class="btn" onclick="exportOrphanPoCSV()">Export CSV</button>
@@ -3195,8 +3362,8 @@ $(if ($safeOrphan -gt 0) {@"
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
       <input type="text" class="search-box" id="atSearch" placeholder="Search access templates...">
       <div style="display:flex;align-items:center;gap:8px">
-        <label style="font-size:.82rem;color:#6b7280;white-space:nowrap">Show
-          <select id="atPageSize" onchange="changeAtPageSize(this.value)" style="padding:4px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:.82rem;background:#fff;cursor:pointer">
+        <label style="font-size:.82rem;color:#5d7079;white-space:nowrap">Show
+          <select id="atPageSize" onchange="changeAtPageSize(this.value)" style="padding:4px 8px;border:1px solid #cad4d7;border-radius:6px;font-size:.82rem;background:#fff;cursor:pointer">
             <option value="10" selected>10</option>
             <option value="25">25</option>
             <option value="50">50</option>
@@ -3213,14 +3380,14 @@ $(if ($safeOrphan -gt 0) {@"
   </div>
 </div>
 $(if ($safeOrphanAt -gt 0) {@"
-<div class="panel" style="margin-bottom:24px;border-left:4px solid #dc2626">
-  <h2 style="color:#dc2626">Orphan Access Template Links &nbsp;<span class="badge badge-red">$safeOrphanAt found</span></h2>
-  <p style="font-size:.85rem;color:#6b7280;margin-bottom:12px">
+<div class="panel" style="margin-bottom:24px;border-left:4px solid #fb4f14">
+  <h2 style="color:#fb4f14">Orphan Access Template Links &nbsp;<span class="badge badge-red">$safeOrphanAt found</span></h2>
+  <p style="font-size:.85rem;color:#5d7079;margin-bottom:12px">
     These Access Template links reference a missing target object or a missing trustee SID.
     This can occur when objects or security principals are deleted without cleaning up their AT links.
     <br><strong>Recommendation:</strong> Review and remove orphan links using PowerShell.
-    See <a href="https://support.oneidentity.com/kb/4338749" target="_blank" rel="noopener" style="color:#2563eb">KB 4338749</a> for removal instructions
-    and <a href="https://support.oneidentity.com/kb/4381874" target="_blank" rel="noopener" style="color:#2563eb">KB 4381874</a> for additional guidance.
+    See <a href="https://support.oneidentity.com/kb/4338749" target="_blank" rel="noopener" style="color:#0079a1">KB 4338749</a> for removal instructions
+    and <a href="https://support.oneidentity.com/kb/4381874" target="_blank" rel="noopener" style="color:#0079a1">KB 4381874</a> for additional guidance.
   </p>
   <div style="display:flex;justify-content:flex-end;margin-bottom:12px">
     <button class="btn" onclick="exportOrphanAtCSV()">Export CSV</button>
@@ -3254,8 +3421,8 @@ $(if ($safeOrphanAt -gt 0) {@"
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
       <input type="text" class="search-box" id="vaSearch" placeholder="Search attributes...">
       <div style="display:flex;align-items:center;gap:8px">
-        <label style="font-size:.82rem;color:#6b7280;white-space:nowrap">Show
-          <select id="vaPageSize" onchange="changeVaPageSize(this.value)" style="padding:4px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:.82rem;background:#fff;cursor:pointer">
+        <label style="font-size:.82rem;color:#5d7079;white-space:nowrap">Show
+          <select id="vaPageSize" onchange="changeVaPageSize(this.value)" style="padding:4px 8px;border:1px solid #cad4d7;border-radius:6px;font-size:.82rem;background:#fff;cursor:pointer">
             <option value="10" selected>10</option>
             <option value="25">25</option>
             <option value="50">50</option>
@@ -3277,22 +3444,22 @@ $(if ($safeOrphanAt -gt 0) {@"
 <div class="panel-grid">
   <div class="panel" style="grid-column:1/-1">
     <h2>Additional References</h2>
-    <p style="margin:0;line-height:1.6;color:#374151">
+    <p style="margin:0;line-height:1.6;color:#2f4350">
       This report covers the most common health checks for Active Roles. For a comprehensive list
       of additional known issues, workarounds, and troubleshooting references, please consult the
       official One Identity Knowledge Base articles:
     </p>
     <p style="margin:12px 0 0 0">
       <a href="https://support.oneidentity.com/kb/4340870" target="_blank" rel="noopener noreferrer"
-         style="display:inline-block;padding:10px 16px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;margin-right:8px;margin-bottom:8px">
+         style="display:inline-block;padding:10px 16px;background:#04aada;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;margin-right:8px;margin-bottom:8px">
         One Identity KB 4340870 &mdash; Active Roles Known Issues &rarr;
       </a>
       <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener noreferrer"
-         style="display:inline-block;padding:10px 16px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;margin-bottom:8px">
+         style="display:inline-block;padding:10px 16px;background:#04aada;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;margin-bottom:8px">
         One Identity KB 4383609 &mdash; Recommended SQL settings for Active Roles performance &rarr;
       </a>
     </p>
-    <p style="margin:12px 0 0 0;font-size:.85rem;color:#6b7280">
+    <p style="margin:12px 0 0 0;font-size:.85rem;color:#5d7079">
       Review these knowledge bases periodically as One Identity publishes updates, hotfixes and
       advisories for the product.
     </p>
@@ -3341,7 +3508,7 @@ function sortVATable(i){const k=VA_COLUMNS[i].key;if(vaS.sortCol===i)vaS.sortAsc
 function filterVATable(q){q=q.toLowerCase().trim();vaS.filtered=q===''?[...vaS.data]:vaS.data.filter(r=>VA_COLUMNS.some(c=>(r[c.key]??'').toString().toLowerCase().includes(q)));vaS.page=1;renderVATableBody()}
 function goVAPage(p){const tp=Math.ceil(vaS.filtered.length/vaS.pageSize);if(p<1||p>tp)return;vaS.page=p;renderVATableBody()}
 function exportVACSV(){const h=VA_COLUMNS.map(c=>c.label).join(',');const rows=vaS.filtered.map(r=>VA_COLUMNS.map(c=>'"'+(r[c.key]??'').toString().replace(/"/g,'""')+'"').join(','));const csv='\uFEFF'+h+'\n'+rows.join('\n');const b=new Blob([csv],{type:'text/csv;charset=utf-8;'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='virtual_attributes_'+new Date().toISOString().slice(0,10)+'.csv';a.click()}
-Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
+Chart.defaults.font.family = "'Noto Sans', Verdana, 'Segoe UI', system-ui, sans-serif";
 Chart.defaults.font.size = 12;
 
 const doughnutOpts = {
@@ -3364,14 +3531,14 @@ if (UC_DATA && UC_DATA.length > 0) {
         {
           label: 'Enabled',
           data: UC_DATA.map(d => d.enabled || 0),
-          backgroundColor: '#16a34a',
+          backgroundColor: '#77c8b3',
           borderRadius: 6,
           maxBarThickness: 60
         },
         {
           label: 'Disabled',
           data: UC_DATA.map(d => d.disabled || 0),
-          backgroundColor: '#dc2626',
+          backgroundColor: '#fb4f14',
           borderRadius: 6,
           maxBarThickness: 60
         }
@@ -3386,7 +3553,7 @@ if (UC_DATA && UC_DATA.length > 0) {
       },
       scales: {
         x: { stacked: true, grid: { display: false } },
-        y: { stacked: true, beginAtZero: true, ticks: { precision: 0 }, grid: { color: '#f3f4f6' } }
+        y: { stacked: true, beginAtZero: true, ticks: { precision: 0 }, grid: { color: '#eef2f3' } }
       }
     }
   });
@@ -3397,7 +3564,7 @@ new Chart(document.getElementById('dgChart'), {
   type: 'doughnut',
   data: {
     labels: ['Healthy', 'Broken Rules'],
-    datasets: [{ data: $dgChartData, backgroundColor: ['#16a34a','#dc2626'], borderWidth: 0 }]
+    datasets: [{ data: $dgChartData, backgroundColor: ['#77c8b3','#fb4f14'], borderWidth: 0 }]
   },
   options: doughnutOpts
 });
@@ -3407,7 +3574,7 @@ new Chart(document.getElementById('muChart'), {
   type: 'doughnut',
   data: {
     labels: ['Healthy', 'Broken Rules'],
-    datasets: [{ data: $muChartData, backgroundColor: ['#16a34a','#dc2626'], borderWidth: 0 }]
+    datasets: [{ data: $muChartData, backgroundColor: ['#77c8b3','#fb4f14'], borderWidth: 0 }]
   },
   options: doughnutOpts
 });
@@ -3417,7 +3584,7 @@ new Chart(document.getElementById('wfChart'), {
   type: 'doughnut',
   data: {
     labels: ['Enabled', 'Disabled'],
-    datasets: [{ data: $wfChartData, backgroundColor: ['#16a34a','#dc2626'], borderWidth: 0 }]
+    datasets: [{ data: $wfChartData, backgroundColor: ['#77c8b3','#fb4f14'], borderWidth: 0 }]
   },
   options: doughnutOpts
 });
@@ -3430,7 +3597,7 @@ new Chart(document.getElementById('poChart'), {
   type: 'doughnut',
   data: {
     labels: ['Enabled', 'Disabled', 'Orphan Links'],
-    datasets: [{ data: $poChartData, backgroundColor: ['#16a34a','#d97706','#dc2626'], borderWidth: 0 }]
+    datasets: [{ data: $poChartData, backgroundColor: ['#77c8b3','#ee8a54','#fb4f14'], borderWidth: 0 }]
   },
   options: doughnutOpts
 });
@@ -3468,7 +3635,7 @@ new Chart(document.getElementById('atChart'), {
   type: 'doughnut',
   data: {
     labels: ['Custom', 'Orphan Links'],
-    datasets: [{ data: $atChartData, backgroundColor: ['#2563eb','#dc2626'], borderWidth: 0 }]
+    datasets: [{ data: $atChartData, backgroundColor: ['#04aada','#fb4f14'], borderWidth: 0 }]
   },
   options: doughnutOpts
 });
@@ -3493,7 +3660,7 @@ new Chart(document.getElementById('vaChart'), {
   type: 'doughnut',
   data: {
     labels: ['Custom', 'Built-in'],
-    datasets: [{ data: $vaChartData, backgroundColor: ['#2563eb','#9ca3af'], borderWidth: 0 }]
+    datasets: [{ data: $vaChartData, backgroundColor: ['#04aada','#cad4d7'], borderWidth: 0 }]
   },
   options: doughnutOpts
 });
@@ -3543,6 +3710,7 @@ try {
             DisabledTotal = 0
             PerDomain     = @()
             ExcludedOUs   = @()
+            ExcludedMUs   = @()
             Skipped       = $true
         }
     }
