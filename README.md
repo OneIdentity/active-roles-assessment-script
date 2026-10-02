@@ -10,24 +10,34 @@ A PowerShell script that connects to a One Identity Active Roles installation, c
 
 - Active Roles version and build
 - Operating system information
-- Managed domains (with optional managed user counts, including a stacked **Enabled vs Disabled** breakdown per domain)
+- Managed domains (with optional managed user counts per domain). The **Users per Domain** table shows **Accounts**, On-Prem Only, Hybrid, gMSA and Excluded OUs Users, with a **Total** row. Only **active (enabled) accounts** are counted — disabled accounts are excluded from every figure and from the Managed Users chart
 - Replication partners (Publisher / Subscribers) — Configuration DB and Management History DB
 - Dynamic Groups
   - Optional broken-rules check
   - **Distribution across Active Roles servers**, with a warning when groups are not evenly balanced
   - **Top 10 expensive LDAP queries** (by `accountNameHistory` length), flagging any group with `>= 1000` cached entries as *Expensive*
+  - **Parallel Handling** KPI and card (between *Expensive LDAP Queries* and *Managed Units*) — shown **only** when the detected Active Roles version is **8.2.1 SP6 (build 8.2.1.149) or later** *and* Dynamic Groups exist. Informational: it asks you to review the `DynamicGroupParallelHandlingNumber` registry value (range 2–8, default 2, recommended 3) on each Administration Service instance that manages Dynamic Groups. The value is per server, so the script does not read it ([KB 4382821](https://old-support.oneidentity.com/kb/4382821), [Administration Guide](https://docs.oneidentity.com/bundle/active-roles_administration-guide_8.7/page/guides/administrationguide/dynamic-groups-parallel-threads.htm))
 - Managed Units (with optional broken-rules check)
-- Workflows
+- Workflows (built-in workflows and folders/containers are not counted)
 - Virtual Attributes
 - Script Modules and Policy Objects (including orphan policy links)
+- **Overlapping AP Links** (section 7.1, with its own KPI) — the same policy linked to a container and again to one of its child containers. Lists the policy, parent target, child target and the **Child Link DN** (to locate the link in Active Roles), explains the processing overhead that redundant links cause, and supports search, sorting, paging and Export CSV
 - Access Templates (including orphan AT links)
 - Microsoft Entra (Azure AD) tenants configured in Active Roles
 - Microsoft Exchange presence and `PerformanceFlag` / `Disable500VA` registry checks
 - SQL Server **Auto Shrink** status on the AR Configuration database
 - SQL Server **AlwaysOn / MultiSubnetFailoverSupport** check
-- SQL Server **Parallelism Settings** check — Cost Threshold for Parallelism and MaxDOP compared against One Identity recommendations ([KB 4383609](https://support.oneidentity.com/kb/4383609))
+- SQL Server **Parallelism Settings** check — Cost Threshold for Parallelism and MaxDOP compared against One Identity recommendations ([KB 4383609](https://old-support.oneidentity.com/kb/4383609))
 
 The output is a single self-contained `.html` file with KPI cards, charts, and searchable/sortable tables. Chart.js is loaded from CDN.
+
+### Data collection and performance
+
+Configuration data (version, managed domains, servers, replication partners, Managed Units, workflows, virtual attributes, script modules, policy objects and links, Access Template links, Access Templates, Microsoft Entra tenants and the overlapping AP Links analysis) is collected through the Active Roles **EDMS provider** (`Invoke-EDMSSearch` / `Get-EDMSObjects`), which is significantly faster than the Management Shell cmdlets. Only the Dynamic Groups collection still uses `Get-QADGroup -Dynamic`.
+
+### Knowledge Base links
+
+KB links in the report and in this document point to `old-support.oneidentity.com`, the temporary location of the One Identity Knowledge Base until the final solution is available.
 
 ---
 
@@ -106,7 +116,7 @@ whoami
 | `-ARServer` | `string` | Active Roles server name or IP. Defaults to local auto-connect. |
 | `-OutputPath` | `string` | Full path for the HTML report. Defaults to `.\AR_Assessment_<yyyyMMdd_HHmmss>.html`. |
 | `-SkipBrokenRulesCheck` | `switch` | Skip GUID validation for Dynamic Groups and Managed Units membership rules. Recommended for large environments. |
-| `-SkipUserCounts` | `switch` | Skip the managed user count per domain. Recommended for environments with many users. |
+| `-SkipUserCounts` | `switch` | Skip the managed user count per domain (active accounts only). Recommended for environments with many users. |
 | `-SqlCredential` | `PSCredential` | SQL Server credential used by the Auto Shrink, AlwaysOn, and Parallelism checks when the AR Configuration database uses SQL Authentication. If omitted, Windows Authentication is used. |
 
 ---
@@ -155,9 +165,11 @@ Use this only if the AR Configuration database is configured for SQL Server Auth
 | `Failed to load Active Roles Management Shell` | Module not installed on this host | Install the Active Roles Management Shell, or run on the AR server. |
 | `Failed to connect to Active Roles Service` | AR service stopped or unreachable | Check the service: `Get-ARServiceStatus`. |
 | SQL checks (Auto Shrink / AlwaysOn / Parallelism) return `Access denied` or `Login failed` | The current user is not the AR service account and has no SQL access | Re-run under the AR service account, or use `-SqlCredential`. |
-| Parallelism section shows `Action Required` | `Cost Threshold for Parallelism` is below 50 or `MaxDOP` is not 4 | Engage your DBA and review against [KB 4383609](https://support.oneidentity.com/kb/4383609). |
+| Parallelism section shows `Action Required` | `Cost Threshold for Parallelism` is below 50 or `MaxDOP` is not 4 | Engage your DBA and review against [KB 4383609](https://old-support.oneidentity.com/kb/4383609). |
 | Dynamic Groups distribution warning is shown | Groups are concentrated on a single AR server in a multi-server environment | Verify whether this is intentional (dedicated Dynamic Group server). If not, rebalance Dynamic Group ownership. |
 | Many Dynamic Groups flagged as `Expensive` | Membership queries return very large result sets (`accountNameHistory >= 1000`) | Review the group membership rules; narrow scope or filters where possible to reduce AR and DC load. |
+| Overlapping AP Links are reported | A policy is linked to a container and again to a child container | Review each child link (use the *Child Link DN* column) and remove it unless it is an intentional per-link override. Redundant links add processing overhead. |
+| Parallel Handling card is not displayed | Detected version is older than 8.2.1.149, or there are no Dynamic Groups | Expected behavior — the card only appears for 8.2.1 SP6 (8.2.1.149) or later with Dynamic Groups configured. |
 | Script appears to hang | Broken-rules check iterating over many Dynamic Groups / Managed Units | Re-run with `-SkipBrokenRulesCheck`. |
 | Charts are blank in the HTML | Host viewing the report has no internet access to the Chart.js CDN | Open the report on a machine with outbound internet. |
 | Version shows `Unknown` | Script is not running on the AR server, or not running elevated | Run on the AR server as Administrator. |

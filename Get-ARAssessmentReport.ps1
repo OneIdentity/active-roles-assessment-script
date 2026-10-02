@@ -288,8 +288,7 @@ function New-ArSqlConnection {
 function Test-GUIDExists {
     param([string]$Guid)
     try {
-        $obj = Get-QADObject -Identity $Guid -DontUseDefaultIncludedProperties -proxy -ErrorAction Stop
-        return ($null -ne $obj)
+        return [System.DirectoryServices.DirectoryEntry]::Exists("EDMS://<GUID=$($Guid.Trim('{','}'))>")
     }
     catch {
         return $false
@@ -320,7 +319,7 @@ function Get-BrokenRulesList {
             -PercentComplete ([math]::Min(100, ($count / [math]::Max(1, $total)) * 100))
 
         try {
-            $conditions = $obj.$ConditionsAttribute
+            $conditions = @($obj.$ConditionsAttribute) -join ';'
             if (-not $conditions) { continue }
 
             $rules = $conditions.Split(';')
@@ -368,12 +367,25 @@ function Get-ARVersionInfo {
 
     # Primary: query AR Server objects (edsARService) for version info
     try {
-        $serverObjects = Get-QADObject `
-            -SearchRoot 'CN=Administration Services,CN=Server Configuration,CN=Configuration' `
-            -Proxy -Type edsARService `
-            -DontUseDefaultIncludedProperties `
-            -IncludedProperties 'name', 'edsaEdmServiceComputerName', 'edsaStoredProductVersion' `
-            -SizeLimit 100 -ErrorAction Stop
+        $serverResults = Invoke-EDMSSearch -SearchRoot "CN=Administration Services,CN=Server Configuration,CN=Configuration" `
+                                           -LDAPFilter "(objectClass=edsARService)" `
+                                           -Properties name,edsaEdmServiceComputerName,edsaStoredProductVersion `
+                                           -Scope Subtree
+
+        # Copy values out of the SearchResultCollection so it can be disposed right away
+        $serverObjects = @()
+        foreach ($sr in $serverResults) {
+            $srName = $null; $srComputer = $null; $srVersion = $null
+            try { $srName     = $sr.Properties["name"][0] } catch { }
+            try { $srComputer = $sr.Properties["edsaedmservicecomputername"][0] } catch { }
+            try { $srVersion  = $sr.Properties["edsastoredproductversion"][0] } catch { }
+            $serverObjects += [PSCustomObject]@{
+                Name                       = $srName
+                edsaEdmServiceComputerName = $srComputer
+                edsaStoredProductVersion   = $srVersion
+            }
+        }
+        if ($serverResults) { $serverResults.Dispose() }
 
         if ($serverObjects) {
             $arServers = @($serverObjects)
@@ -513,47 +525,55 @@ function Get-OSInfo {
 function Get-ManagedDomains {
     $result = @()
 
-    # Build a lookup of DC per domain from domainDNS objects
-    $dcLookup = @{}
-    try {
-        $dnsDomains = Get-QADObject -Type 'domainDNS' `
-            -DontUseDefaultIncludedProperties `
-            -IncludedProperties 'name', 'edsaLDAPServer', 'edsaDnsName' `
-            -proxy -SizeLimit 0 -ErrorAction SilentlyContinue
-
-        foreach ($dd in @($dnsDomains)) {
-            $key = if ($dd.edsaDnsName) { $dd.edsaDnsName } else { $dd.Name }
-            $dcLookup[$key] = if ($dd.edsaLDAPServer) { $dd.edsaLDAPServer } else { '' }
-        }
-        Write-Log "DC lookup built: $($dcLookup.Count) domain(s) resolved"
-    }
-    catch {
-        Write-Log "Could not build DC lookup from domainDNS: $($_.Exception.Message)" -Level "WARN"
-    }
-
     # Get managed domains from configuration
     try {
-        $domains = Get-QADObject -Type 'edsDomainCacheConfig' `
-            -SearchRoot 'CN=Managed Domains,CN=Server Configuration,CN=Configuration' `
-            -DontUseDefaultIncludedProperties `
-            -IncludedProperties 'name', 'edsaDnsName' `
-            -proxy -SizeLimit 0 -ErrorAction Stop
+        $domainResults = Invoke-EDMSSearch -SearchRoot "CN=Managed Domains,CN=Server Configuration,CN=Configuration" `
+                                           -LDAPFilter "(objectClass=edsDomainCacheConfig)" `
+                                           -Properties name,edsaDnsName,distinguishedName `
+                                           -Scope Subtree
+
+        # Copy values out of the SearchResultCollection so it can be disposed right away
+        $domains = @()
+        foreach ($dr in $domainResults) {
+            $drName = $null; $drDns = $null; $drDN = $null
+            try { $drName = $dr.Properties["name"][0] } catch { }
+            try { $drDns  = $dr.Properties["edsadnsname"][0] } catch { }
+            try { $drDN   = $dr.Properties["distinguishedname"][0] } catch { }
+            $domains += [PSCustomObject]@{ Name = $drName; edsaDnsName = $drDns; DN = $drDN }
+        }
+        if ($domainResults) { $domainResults.Dispose() }
 
         foreach ($d in $domains) {
             $dnsName = if ($d.edsaDnsName) { $d.edsaDnsName } else { $d.Name }
-            $dc = if ($dcLookup.ContainsKey($dnsName)) { $dcLookup[$dnsName] }
-                  elseif ($dcLookup.ContainsKey($d.Name)) { $dcLookup[$d.Name] }
-                  else { '' }
 
-            # Resolve DC site from edsDomainCacheConfig using IncludeAllProperties + SearchScope Base
+            # DC of the domain: read edsaLDAPServer from the domainDNS object of this domain
+            # (base-level EDMS lookup per domain instead of a tenant-wide domainDNS search)
+            $dc = ''
+            try {
+                $domainDN = "DC=$($dnsName -replace '\.',',DC=')"
+                $dnsObj = Invoke-EDMSSearch -SearchRoot $domainDN `
+                                            -LDAPFilter "(objectClass=domainDNS)" `
+                                            -Properties edsaLDAPServer `
+                                            -Scope Base
+                foreach ($o in $dnsObj) {
+                    try { $dc = [string]$o.Properties["edsaldapserver"][0] } catch { }
+                }
+                if ($dnsObj) { $dnsObj.Dispose() }
+            } catch {
+                Write-Log "Could not resolve DC for domain '$dnsName': $($_.Exception.Message)" -Level "WARN"
+            }
+
+            # Resolve DC site from the edsDomainCacheConfig object (Base scope)
             $dcSite = ''
             try {
-                $domainObj = Get-QADObject -SearchRoot $d.DN `
-                    -Proxy -DontUseDefaultIncludedProperties -IncludedProperties 'edsvaPreferredSite' `
-                    -SizeLimit 1 -SearchScope Base -ErrorAction SilentlyContinue
-                if ($domainObj -and $domainObj.edsvaPreferredSite) {
-                    $dcSite = $domainObj.edsvaPreferredSite
+                $siteObj = Invoke-EDMSSearch -SearchRoot $d.DN `
+                                             -LDAPFilter "(objectClass=*)" `
+                                             -Properties edsvaPreferredSite `
+                                             -Scope Base
+                foreach ($o in $siteObj) {
+                    try { $dcSite = [string]$o.Properties["edsvapreferredsite"][0] } catch { }
                 }
+                if ($siteObj) { $siteObj.Dispose() }
             } catch { }
 
             $result += [PSCustomObject]@{
@@ -598,6 +618,54 @@ function Invoke-EDMSSearch {
     return ,$searcher.FindAll()   # comma prevents PowerShell from unrolling the SearchResultCollection
 }
 
+function Get-EDMSObjects {
+    # Wrapper over Invoke-EDMSSearch that returns plain objects (the SearchResultCollection is disposed here).
+    # Each requested attribute becomes a property (single value -> scalar, multi-value -> array, missing -> $null).
+    # Extra properties: Name, DN (distinguishedName) and Type (last objectClass value, when objectClass is requested).
+    # Ranged multi-value attributes (e.g. "attr;range=0-1499") are returned partially, and
+    # the next index to fetch is exposed in the RangeNext hashtable (attribute -> next start index).
+    param(
+        [Parameter(Mandatory)][string]$SearchRoot,
+        [string]$LDAPFilter = "(objectClass=*)",
+        [string[]]$Properties = @(),
+        [System.DirectoryServices.SearchScope]$Scope = [System.DirectoryServices.SearchScope]::Subtree
+    )
+
+    $props = @('distinguishedName', 'name') + $Properties |
+        Group-Object { $_.ToLower() } | ForEach-Object { $_.Group[0] }
+
+    $list = New-Object System.Collections.Generic.List[object]
+    $results = Invoke-EDMSSearch -SearchRoot $SearchRoot -LDAPFilter $LDAPFilter -Properties $props -Scope $Scope
+    try {
+        foreach ($r in $results) {
+            $o = @{}
+            $rangeNext = @{}
+            foreach ($p in $props) {
+                $vals = $r.Properties[$p.ToLower()]
+                if ($vals.Count -eq 0) {
+                    # Ranged retrieval: values come back under "<attr>;range=<lo>-<hi|*>"
+                    foreach ($pn in $r.Properties.PropertyNames) {
+                        if ($pn -like "$($p.ToLower());range=*") {
+                            $vals = $r.Properties[$pn]
+                            if ($pn -match 'range=\d+-(\d+)$') { $rangeNext[$p] = [int]$matches[1] + 1 }
+                            break
+                        }
+                    }
+                }
+                $o[$p] = if ($vals.Count -eq 0) { $null } elseif ($vals.Count -eq 1) { $vals[0] } else { @($vals) }
+            }
+            $o['DN'] = $o['distinguishedName']
+            if ($o.ContainsKey('objectClass') -and $o['objectClass']) { $o['Type'] = @($o['objectClass'])[-1] }
+            $o['RangeNext'] = $rangeNext
+            $list.Add([PSCustomObject]$o)
+        }
+    }
+    finally {
+        if ($results) { $results.Dispose() }
+    }
+    return $list.ToArray()
+}
+
 function Get-ManagedUserCounts {
     <#
     .SYNOPSIS
@@ -611,7 +679,6 @@ function Get-ManagedUserCounts {
         HybridTotal       = 0
         GmsaTotal         = 0
         ExcludedTotal     = 0
-        DisabledTotal     = 0
         PerDomain         = @()
         ExcludedOUs       = @()
         ExcludedMUs       = @()
@@ -623,25 +690,23 @@ function Get-ManagedUserCounts {
     $excludedUserDNs = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
 
     try {
-        $policyObj = Get-QADObject -LdapFilter "(name=Built-in Policy - Exclude from Managed Scope)" `
-            -SearchRoot 'CN=Administration,CN=Policies,CN=Configuration' `
-            -DontUseDefaultIncludedProperties -IncludedProperties 'distinguishedName' `
-            -proxy -SizeLimit 1 -ErrorAction Stop
+        $policyObj = Get-EDMSObjects -SearchRoot "CN=Administration,CN=Policies,CN=Configuration" `
+            -LDAPFilter "(&(objectClass=edsPolicyObject)(name=Built-in Policy - Exclude from Managed Scope))" `
+            -Scope Subtree | Select-Object -First 1
 
         if ($policyObj) {
             $policyDN = $policyObj.DN
             Write-Log "Found 'Exclude from Managed Scope' policy: $policyDN"
 
             # Step 2: Find all Policy Object Links that reference this policy
-            $links = Get-QADObject -Type 'edsPolicyObjectLink' `
-                -SearchRoot 'CN=AP Links,CN=Configuration' `
-                -proxy -IncludeAllProperties -SizeLimit 0 -ErrorAction Stop
+            $links = Get-EDMSObjects -SearchRoot "CN=AP Links,CN=Configuration" `
+                -LDAPFilter "(objectClass=edsPolicyObjectLink)" `
+                -Properties edsvaAPODN,edsvaSecObjectDN `
+                -Scope Subtree
 
-            foreach ($link in @($links)) {
-                $apoDN    = $null
-                $targetDN = $null
-                try { $apoDN    = $link.edsvaAPODN } catch { }
-                try { $targetDN = $link.edsvaSecObjectDN } catch { }
+            foreach ($link in $links) {
+                $apoDN    = $link.edsvaAPODN
+                $targetDN = $link.edsvaSecObjectDN
 
                 if ($apoDN -eq $policyDN -and $targetDN) {
                     # Managed Units live under CN=Managed Units,CN=Configuration
@@ -695,13 +760,15 @@ function Get-ManagedUserCounts {
         $hybridCount   = 0
         $gmsaCount     = 0
         $excludedCount = 0
-        $disabledCount = 0
+
+        # Only enabled (active) accounts are counted: exclude ACCOUNTDISABLE (0x2) server-side
+        $activeOnly = "(!(userAccountControl:1.2.840.113556.1.4.803:=2))"
 
         # On-prem user count via EDMS
         try {
             $userResults = Invoke-EDMSSearch -SearchRoot $domainDN `
-                -LDAPFilter "(&(objectClass=user)(objectCategory=person))" `
-                -Properties @("distinguishedName","userAccountControl")
+                -LDAPFilter "(&(objectClass=user)(objectCategory=person)$activeOnly)" `
+                -Properties @("distinguishedName")
 
             foreach ($u in $userResults) {
                 $uDN = $u.Properties["distinguishedname"][0]
@@ -717,17 +784,11 @@ function Get-ManagedUserCounts {
                     $excludedCount++
                 } else {
                     $userCount++
-                    $uac = 0
-                    if ($u.Properties["useraccountcontrol"].Count -gt 0) {
-                        $uac = [int]$u.Properties["useraccountcontrol"][0]
-                    }
-                    # ACCOUNTDISABLE = 0x2
-                    if ($uac -band 0x2) { $disabledCount++ }
                 }
             }
             if ($userResults) { $userResults.Dispose() }
 
-            Write-Log "Domain '$domainName': $userCount managed user(s), $disabledCount disabled, $excludedCount excluded"
+            Write-Log "Domain '$domainName': $userCount active managed user(s), $excludedCount excluded"
         }
         catch {
             Write-Log "Could not count users for domain '$domainName': $($_.Exception.Message)" -Level "WARN"
@@ -737,7 +798,7 @@ function Get-ManagedUserCounts {
         # Hybrid accounts (edsvaAzureObjectId populated), excluding managed scope via EDMS
         try {
             $hybridResults = Invoke-EDMSSearch -SearchRoot $domainDN `
-                -LDAPFilter "(&(objectClass=user)(objectCategory=person)(edsvaAzureObjectId=*))" `
+                -LDAPFilter "(&(objectClass=user)(objectCategory=person)(edsvaAzureObjectId=*)$activeOnly)" `
                 -Properties @("distinguishedName")
 
             foreach ($h in $hybridResults) {
@@ -763,7 +824,7 @@ function Get-ManagedUserCounts {
         # Group Managed Service Accounts (gMSA), excluding managed scope via EDMS
         try {
             $gmsaResults = Invoke-EDMSSearch -SearchRoot $domainDN `
-                -LDAPFilter "(objectClass=msDS-GroupManagedServiceAccount)" `
+                -LDAPFilter "(&(objectClass=msDS-GroupManagedServiceAccount)$activeOnly)" `
                 -Properties @("distinguishedName")
 
             foreach ($g in $gmsaResults) {
@@ -794,7 +855,6 @@ function Get-ManagedUserCounts {
             onprem   = if ($userCount -ge 0) { [math]::Max(0, $userCount - $hybridCount) } else { -1 }
             gmsa     = $gmsaCount
             excluded = $excludedCount
-            disabled = $disabledCount
         }
     }
 
@@ -803,10 +863,8 @@ function Get-ManagedUserCounts {
     $result.HybridTotal  = ($result.PerDomain | Measure-Object -Property hybrid -Sum).Sum
     $result.GmsaTotal    = ($result.PerDomain | Measure-Object -Property gmsa -Sum).Sum
     $result.ExcludedTotal = ($result.PerDomain | Measure-Object -Property excluded -Sum).Sum
-    $result.DisabledTotal = ($result.PerDomain | Measure-Object -Property disabled -Sum).Sum
 
-    Write-Log "Total managed users across all domains: $($result.TotalCount)"
-    Write-Log "Total disabled users: $($result.DisabledTotal)"
+    Write-Log "Total active managed users across all domains: $($result.TotalCount)"
     Write-Log "Total hybrid accounts: $($result.HybridTotal)"
     Write-Log "Total gMSA accounts: $($result.GmsaTotal)"
     Write-Log "Total users in excluded OUs/MUs: $($result.ExcludedTotal)"
@@ -875,16 +933,12 @@ function Get-ARServers {
 
     # Primary: query AR service objects with detailed properties
     try {
-        $serverObjects = Get-QADObject `
-            -SearchRoot 'CN=Administration Services,CN=Server Configuration,CN=Configuration' `
-            -Proxy -Type edsARService `
-            -DontUseDefaultIncludedProperties `
-            -IncludedProperties 'name', 'edsaEdmServiceComputerName', 'edsvaConfigurationDatabase', `
-                'edsaStoredProductVersion', 'edsvaMHDatabase', 'edsvaDiagnosticLoggingLevel', `
-                'edsvaDiagnosticLogTurnedOn', 'edsaReplicationPartner' `
-            -SizeLimit 100 -ErrorAction Stop
+        $serverObjects = Get-EDMSObjects -SearchRoot "CN=Administration Services,CN=Server Configuration,CN=Configuration" `
+            -LDAPFilter "(objectClass=edsARService)" `
+            -Properties name,edsaEdmServiceComputerName,edsvaConfigurationDatabase,edsaStoredProductVersion,edsvaMHDatabase,edsvaDiagnosticLoggingLevel,edsvaDiagnosticLogTurnedOn,edsaReplicationPartner `
+            -Scope Subtree
 
-        foreach ($s in @($serverObjects)) {
+        foreach ($s in $serverObjects) {
             $partner = if ($s.edsaReplicationPartner) {
                 @($s.edsaReplicationPartner) -join ', '
             } else { "" }
@@ -932,10 +986,10 @@ function Get-ARServers {
         )
         foreach ($q in $fallbackQueries) {
             try {
-                $serverObjects = Get-QADObject -SearchRoot $q.SearchRoot `
-                    -DontUseDefaultIncludedProperties `
-                    -IncludedProperties 'name', 'edsaReplicationPartner', 'description', 'objectClass' `
-                    -proxy -SizeLimit 100 -ErrorAction Stop |
+                $serverObjects = Get-EDMSObjects -SearchRoot $q.SearchRoot `
+                    -LDAPFilter $q.LdapFilter `
+                    -Properties name,edsaReplicationPartner,description,objectClass `
+                    -Scope Subtree |
                     Where-Object { $_.Type -match 'eds.*[Ss]erv' -or $_.Name -match '^[A-Z].*\.' }
 
                 foreach ($s in $serverObjects) {
@@ -989,18 +1043,14 @@ function Get-ReplicationPartnersInfo {
 
     try {
         Write-Log "Collecting Replication Partners..."
-        $replObjects = Get-QADObject `
-            -SearchRoot 'CN=Configuration Databases,CN=Server Configuration,CN=Configuration' `
-            -Proxy -Type edsReplicationPartner `
-            -DontUseDefaultIncludedProperties `
-            -IncludedProperties 'name', 'edsaDatabaseName', 'edsaSQLAlias', `
-                'edsaDatabaseType', 'edsaReplicationRole' `
-            -SizeLimit 100 -ErrorAction Stop
+        $replObjects = Get-EDMSObjects -SearchRoot "CN=Configuration Databases,CN=Server Configuration,CN=Configuration" `
+            -LDAPFilter "(objectClass=edsReplicationPartner)" `
+            -Properties name,edsaDatabaseName,edsaSQLAlias,edsaDatabaseType,edsaReplicationRole `
+            -Scope Subtree
 
-        foreach ($r in @($replObjects)) {
+        foreach ($r in $replObjects) {
             # Replication Role: 1 = Publisher, 2 = Subscriber, 3 = Not configured
-            $roleRaw = $null
-            try { $roleRaw = $r.edsaReplicationRole } catch { }
+            $roleRaw = $r.edsaReplicationRole
             $roleLabel = switch ([string]$roleRaw) {
                 '1'     { 'Publisher' }
                 '2'     { 'Subscriber' }
@@ -1038,17 +1088,13 @@ function Get-MHReplicationPartnersInfo {
 
     try {
         Write-Log "Collecting Management History Replication Partners..."
-        $replObjects = Get-QADObject `
-            -SearchRoot 'CN=Management History Databases,CN=Server Configuration,CN=Configuration' `
-            -Proxy -Type edsMHReplicationPartner `
-            -DontUseDefaultIncludedProperties `
-            -IncludedProperties 'name', 'edsaDatabaseName', 'edsaSQLAlias', `
-                'edsaDatabaseType', 'edsaReplicationRole' `
-            -SizeLimit 100 -ErrorAction Stop
+        $replObjects = Get-EDMSObjects -SearchRoot "CN=Management History Databases,CN=Server Configuration,CN=Configuration" `
+            -LDAPFilter "(objectClass=edsMHReplicationPartner)" `
+            -Properties name,edsaDatabaseName,edsaSQLAlias,edsaDatabaseType,edsaReplicationRole `
+            -Scope Subtree
 
-        foreach ($r in @($replObjects)) {
-            $roleRaw = $null
-            try { $roleRaw = $r.edsaReplicationRole } catch { }
+        foreach ($r in $replObjects) {
+            $roleRaw = $r.edsaReplicationRole
             $roleLabel = switch ([string]$roleRaw) {
                 '1'     { 'Publisher' }
                 '2'     { 'Subscriber' }
@@ -1213,11 +1259,10 @@ function Get-ManagedUnitsInfo {
 
     try {
         Write-Log "Collecting Managed Units..."
-        $mus = Get-QADObject -Type 'edsManagedUnit' `
-            -SearchRoot 'CN=Managed Units,CN=Configuration' `
-            -DontUseDefaultIncludedProperties `
-            -IncludedProperties 'name', 'edsaMUConditionsList' `
-            -proxy -SizeLimit 0 -ErrorAction Stop
+        $mus = Get-EDMSObjects -SearchRoot "CN=Managed Units,CN=Configuration" `
+            -LDAPFilter "(objectClass=edsManagedUnit)" `
+            -Properties name,edsaMUConditionsList `
+            -Scope Subtree
 
         $result.TotalCount = @($mus).Count
         Write-Log "Found $($result.TotalCount) Managed Unit(s)"
@@ -1253,22 +1298,25 @@ function Get-WorkflowsInfo {
     }
 
     try {
-        $objs = Get-QADObject -SearchRoot 'CN=Workflow,CN=Policies,CN=Configuration' `
-            -DontUseDefaultIncludedProperties `
-            -IncludedProperties 'name', 'edsaWorkflowIsDisabled', 'distinguishedName', 'description' `
-            -proxy -SizeLimit 0 -ErrorAction Stop
+        $workflowRoot = 'CN=Workflow,CN=Policies,CN=Configuration'
+        $objs = Get-EDMSObjects -SearchRoot $workflowRoot `
+            -LDAPFilter "(objectClass=*)" `
+            -Properties name,edsaWorkflowIsDisabled,description,objectClass `
+            -Scope Subtree
 
-        foreach ($obj in @($objs)) {
+        foreach ($obj in $objs) {
+            # Skip the search root itself (LDAP subtree searches include the base object)
+            if ($obj.DN -eq $workflowRoot) { continue }
+            # Skip folders/containers: only workflow definitions must be counted
+            if ($obj.Type -match 'container') { continue }
             # Exclude builtin workflows
             if ($obj.DN -and $obj.DN -like "*$builtinContainer*") { continue }
 
             $isDisabled = $false
-            try {
-                $disabledVal = $obj.edsaWorkflowIsDisabled
-                if ($disabledVal -eq $true -or $disabledVal -eq 'True') {
-                    $isDisabled = $true
-                }
-            } catch { }
+            $disabledVal = $obj.edsaWorkflowIsDisabled
+            if ($disabledVal -eq $true -or $disabledVal -eq 'True') {
+                $isDisabled = $true
+            }
 
             $result.List += [PSCustomObject]@{
                 name        = ConvertTo-SafeHtml $obj.Name
@@ -1301,19 +1349,21 @@ function Get-VirtualAttributesInfo {
     }
 
     try {
-        $attrs = Get-QADObject -SearchRoot 'CN=Virtual Attributes,CN=Server Configuration,CN=Configuration' `
-            -DontUseDefaultIncludedProperties `
-            -IncludedProperties 'name', 'description', 'attributeSyntax', 'edsaSystemObject' `
-            -proxy -SizeLimit 0 -ErrorAction Stop
+        $vaRoot = 'CN=Virtual Attributes,CN=Server Configuration,CN=Configuration'
+        $attrs = Get-EDMSObjects -SearchRoot $vaRoot `
+            -LDAPFilter "(objectClass=*)" `
+            -Properties name,description,attributeSyntax,edsaSystemObject `
+            -Scope Subtree
 
         foreach ($a in $attrs) {
+            # Skip the search root itself (LDAP subtree searches include the base object)
+            if ($a.DN -eq $vaRoot) { continue }
+
             $isSystem = $false
-            try {
-                $sysVal = $a.edsaSystemObject
-                if ($sysVal -eq $true -or $sysVal -eq 'True') {
-                    $isSystem = $true
-                }
-            } catch { }
+            $sysVal = $a.edsaSystemObject
+            if ($sysVal -eq $true -or $sysVal -eq 'True') {
+                $isSystem = $true
+            }
 
             $result.List += [PSCustomObject]@{
                 name        = ConvertTo-SafeHtml $a.Name
@@ -1340,10 +1390,11 @@ function Get-VirtualAttributesInfo {
 function Get-ScriptPoliciesCount {
     $builtinContainer = 'CN=Builtin,CN=Script Modules,CN=Configuration'
     try {
-        $objs = Get-QADObject -SearchRoot 'CN=Script Modules,CN=Configuration' `
-            -DontUseDefaultIncludedProperties -proxy -SizeLimit 0 -ErrorAction Stop
-        $filtered = @($objs) | Where-Object { $_.DN -notlike "*$builtinContainer*" }
-        $count = $filtered.Count
+        $scriptRoot = 'CN=Script Modules,CN=Configuration'
+        $objs = Get-EDMSObjects -SearchRoot $scriptRoot -LDAPFilter "(objectClass=*)" -Scope Subtree
+        # Skip the search root itself (LDAP subtree searches include the base object)
+        $filtered = @($objs) | Where-Object { $_.DN -ne $scriptRoot -and $_.DN -notlike "*$builtinContainer*" }
+        $count = @($filtered).Count
         Write-Log "Found $count Script Module(s) (excluded builtin container)"
         return $count
     }
@@ -1366,24 +1417,21 @@ function Get-PolicyObjectsInfo {
     }
 
     try {
-        $objs = Get-QADObject -Type 'edsPolicyObject' `
-            -SearchRoot 'CN=Administration,CN=Policies,CN=Configuration' `
-            -DontUseDefaultIncludedProperties `
-            -IncludedProperties 'name', 'edsaPolicyDisabled', 'distinguishedName', 'description' `
-            -proxy -SizeLimit 0 -ErrorAction Stop
+        $objs = Get-EDMSObjects -SearchRoot "CN=Administration,CN=Policies,CN=Configuration" `
+            -LDAPFilter "(objectClass=edsPolicyObject)" `
+            -Properties name,edsaPolicyDisabled,description `
+            -Scope Subtree
 
-        foreach ($obj in @($objs)) {
+        foreach ($obj in $objs) {
             # Exclude built-in policies by name prefix and builtin container
             if ($obj.Name -like 'Built-in Policy -*') { continue }
             if ($obj.DN -and $obj.DN -like "*$builtinContainer*") { continue }
 
             $isDisabled = $false
-            try {
-                $disabledVal = $obj.edsaPolicyDisabled
-                if ($disabledVal -eq $true -or $disabledVal -eq 'True') {
-                    $isDisabled = $true
-                }
-            } catch { }
+            $disabledVal = $obj.edsaPolicyDisabled
+            if ($disabledVal -eq $true -or $disabledVal -eq 'True') {
+                $isDisabled = $true
+            }
 
             $result.List += [PSCustomObject]@{
                 name        = ConvertTo-SafeHtml $obj.Name
@@ -1415,15 +1463,14 @@ function Get-OrphanPolicyLinks {
     }
 
     try {
-        $links = Get-QADObject -Type 'edsPolicyObjectLink' `
-            -SearchRoot 'CN=AP Links,CN=Configuration' `
-            -proxy -IncludeAllProperties -SizeLimit 0 -ErrorAction Stop
+        $links = Get-EDMSObjects -SearchRoot "CN=AP Links,CN=Configuration" `
+            -LDAPFilter "(objectClass=edsPolicyObjectLink)" `
+            -Properties edsvaSecObjectDN,edsvaAPODN `
+            -Scope Subtree
 
-        foreach ($link in @($links)) {
-            $targetDN = $null
-            $apoDN    = $null
-            try { $targetDN = $link.edsvaSecObjectDN } catch { }
-            try { $apoDN    = $link.edsvaAPODN } catch { }
+        foreach ($link in $links) {
+            $targetDN = $link.edsvaSecObjectDN
+            $apoDN    = $link.edsvaAPODN
 
             $targetMissing = [string]::IsNullOrWhiteSpace($targetDN)
             $apoMissing    = [string]::IsNullOrWhiteSpace($apoDN)
@@ -1434,7 +1481,7 @@ function Get-OrphanPolicyLinks {
                 if ($apoMissing)    { $reason += 'Missing policy object (edsvaAPODN)' }
 
                 $result.List += [PSCustomObject]@{
-                    dn     = ConvertTo-SafeHtml $link.distinguishedName
+                    dn     = ConvertTo-SafeHtml $link.DN
                     reason = ConvertTo-SafeHtml ($reason -join '; ')
                 }
             }
@@ -1445,6 +1492,96 @@ function Get-OrphanPolicyLinks {
     }
     catch {
         Write-Log "Could not collect orphan policy links: $($_.Exception.Message)" -Level "WARN"
+    }
+
+    return $result
+}
+
+function Get-OverlappingPolicyLinks {
+    # Detects Policy Object Links (AP Links) where the same policy is linked at a
+    # container AND again at one of its descendants. Objects under the descendant
+    # receive the same policy twice, so the child link is redundant (overlap).
+    # Based on Find-ARSOverlappingPolicyLinks.ps1 (case 00214470), using EDMS for speed.
+    $result = [PSCustomObject]@{
+        Count = 0
+        List  = @()
+    }
+
+    try {
+        # Policy DN -> name map (for display only)
+        $policyNames = @{}
+        $policies = Invoke-EDMSSearch -SearchRoot "CN=Administration,CN=Policies,CN=Configuration" `
+                                      -LDAPFilter "(objectClass=edsPolicyObject)" `
+                                      -Properties name,distinguishedName `
+                                      -Scope Subtree
+        foreach ($p in $policies) {
+            try { $policyNames[$p.Properties["distinguishedname"][0].ToString().ToLower()] = $p.Properties["name"][0] } catch { }
+        }
+        if ($policies) { $policies.Dispose() }
+
+        $links = Invoke-EDMSSearch -SearchRoot "CN=AP Links,CN=Configuration" `
+                                   -LDAPFilter "(objectClass=edsPolicyObjectLink)" `
+                                   -Properties edsvaAPODN,edsvaSecObjectDN,distinguishedName `
+                                   -Scope Subtree
+
+        # Group target DNs by policy DN
+        $byPolicy = @{}
+        $linkDNs  = @{}   # "<policyDN>|<targetDN>" -> AP Link object DN (shown so the link can be found in Active Roles)
+        foreach ($link in $links) {
+            $apoDN = $null; $targetDN = $null; $linkDN = $null
+            try { $apoDN    = $link.Properties["edsvaapodn"][0] } catch { }
+            try { $targetDN = $link.Properties["edsvasecobjectdn"][0] } catch { }
+            try { $linkDN   = $link.Properties["distinguishedname"][0] } catch { }
+            if ([string]::IsNullOrWhiteSpace($apoDN) -or [string]::IsNullOrWhiteSpace($targetDN)) { continue }  # orphans are reported separately
+
+            $key = $apoDN.ToString().Trim().ToLower()
+            if (-not $byPolicy.ContainsKey($key)) {
+                $byPolicy[$key] = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+            }
+            [void]$byPolicy[$key].Add($targetDN.ToString().Trim())
+            $linkKey = "$key|$($targetDN.ToString().Trim().ToLower())"
+            if (-not $linkDNs.ContainsKey($linkKey)) { $linkDNs[$linkKey] = $linkDN }
+        }
+        if ($links) { $links.Dispose() }
+
+        $rows = New-Object System.Collections.Generic.List[object]
+        foreach ($policyKey in $byPolicy.Keys) {
+            $targets = $byPolicy[$policyKey]
+            if ($targets.Count -lt 2) { continue }
+            $policyName = if ($policyNames.ContainsKey($policyKey)) { $policyNames[$policyKey] } else { $policyKey }
+
+            foreach ($child in $targets) {
+                # Walk up the DN (unescaped commas only) until a linked ancestor is found.
+                # The first match is the closest ancestor.
+                $cursor = $child
+                $parent = $null
+                while ($true) {
+                    $idx = -1
+                    for ($i = 0; $i -lt $cursor.Length; $i++) {
+                        if ($cursor[$i] -eq ',' -and ($i -eq 0 -or $cursor[$i - 1] -ne '\')) { $idx = $i; break }
+                    }
+                    if ($idx -lt 0) { break }
+                    $cursor = $cursor.Substring($idx + 1)
+                    if ($targets.Contains($cursor)) { $parent = $cursor; break }
+                }
+
+                if ($parent) {
+                    $rows.Add([PSCustomObject]@{
+                        policy     = ConvertTo-SafeHtml $policyName
+                        parent     = ConvertTo-SafeHtml $parent
+                        child      = ConvertTo-SafeHtml $child
+                        childLinkDN = ConvertTo-SafeHtml $linkDNs["$policyKey|$($child.ToLower())"]
+                    })
+                }
+            }
+        }
+
+        $result.List  = @($rows | Sort-Object policy, child)
+        $result.Count = $result.List.Count
+        Write-Log "Found $($result.Count) overlapping Policy Object Link(s)."
+    }
+    catch {
+        Write-Log "Could not collect overlapping policy links: $($_.Exception.Message)" -Level "WARN"
     }
 
     return $result
@@ -1466,19 +1603,17 @@ function Get-AccessTemplatesInfo {
 
     foreach ($path in $paths) {
         try {
-            $objs = Get-QADObject -Type 'edsAccessTemplate' -SearchRoot $path `
-                -DontUseDefaultIncludedProperties `
-                -IncludedProperties 'name', 'distinguishedName', 'description', 'edsaSystemObject' `
-                -proxy -SizeLimit 0 -ErrorAction Stop
+            $objs = Get-EDMSObjects -SearchRoot $path `
+                -LDAPFilter "(objectClass=edsAccessTemplate)" `
+                -Properties name,description,edsaSystemObject `
+                -Scope Subtree
 
-            foreach ($obj in @($objs)) {
+            foreach ($obj in $objs) {
                 $isSystem = $false
-                try {
-                    $sysVal = $obj.edsaSystemObject
-                    if ($sysVal -eq $true -or $sysVal -eq 'True') {
-                        $isSystem = $true
-                    }
-                } catch { }
+                $sysVal = $obj.edsaSystemObject
+                if ($sysVal -eq $true -or $sysVal -eq 'True') {
+                    $isSystem = $true
+                }
 
                 $result.List += [PSCustomObject]@{
                     name        = ConvertTo-SafeHtml $obj.Name
@@ -1517,12 +1652,20 @@ function Get-AzureTenantsInfo {
 
     try {
         Write-Log "Collecting Azure / Microsoft Entra tenants..."
-        $tenants = Get-QADObject `
-            -SearchRoot "CN=Azure Tenants,CN=Azure Configuration,CN=Azure,CN=Configuration" `
-            -proxy -Type edsAzureTenant `
-            -DontUseDefaultIncludedProperties `
-            -IncludedProperties 'name', 'edsaAzureADTenantType' `
-            -SizeLimit 0 -ErrorAction Stop
+        $tenantResults = Invoke-EDMSSearch -SearchRoot "CN=Azure Tenants,CN=Azure Configuration,CN=Azure,CN=Configuration" `
+                                           -LDAPFilter "(objectClass=edsAzureTenant)" `
+                                           -Properties name,edsaAzureADTenantType `
+                                           -Scope Subtree
+
+        # Copy the needed values out of the SearchResultCollection so it can be disposed right away
+        $tenants = @()
+        foreach ($tr in $tenantResults) {
+            $tName = $null; $tType = $null
+            try { $tName = $tr.Properties["name"][0] } catch { }
+            try { $tType = $tr.Properties["edsaazureadtenanttype"][0] } catch { }
+            $tenants += [PSCustomObject]@{ Name = $tName; edsaAzureADTenantType = $tType }
+        }
+        if ($tenantResults) { $tenantResults.Dispose() }
 
         if (-not $tenants) {
             Write-Log "No Azure tenants found"
@@ -1533,8 +1676,7 @@ function Get-AzureTenantsInfo {
         $result.TotalCount = @($tenants).Count
 
         foreach ($tenant in @($tenants)) {
-            $tenantTypeRaw = $null
-            try { $tenantTypeRaw = $tenant.edsaAzureADTenantType } catch { }
+            $tenantTypeRaw = $tenant.edsaAzureADTenantType
             $tenantTypeStr = [string]$tenantTypeRaw
             $tenantType = switch ($tenantTypeStr) {
                 '1' { 'Non Federated Domain' }
@@ -1615,15 +1757,17 @@ function Get-OrphanATLinks {
     }
 
     try {
-        $links = Get-QADObject -Type 'edsACE' `
-            -SearchRoot 'CN=AT Links,CN=Configuration' `
-            -proxy -IncludeAllProperties -SizeLimit 0 -ErrorAction Stop
+        $links = Invoke-EDMSSearch -SearchRoot "CN=AT Links,CN=Configuration" `
+                                   -LDAPFilter "(objectClass=edsACE)" `
+                                   -Properties edsvaSecObjectDN,edsaTrusteeSID,distinguishedName `
+                                   -Scope Subtree
 
-        foreach ($link in @($links)) {
+        foreach ($link in $links) {
             $targetDN   = $null
             $trusteeSID = $null
-            try { $targetDN   = $link.edsvaSecObjectDN } catch { }
-            try { $trusteeSID = $link.edsaTrusteeSID } catch { }
+            # EDMS results expose values through .Properties; attribute names are lowercase
+            try { $targetDN   = $link.Properties["edsvasecobjectdn"][0] } catch { }
+            try { $trusteeSID = $link.Properties["edsatrusteesid"][0] } catch { }
 
             $targetMissing  = [string]::IsNullOrWhiteSpace($targetDN)
             $trusteeMissing = [string]::IsNullOrWhiteSpace($trusteeSID)
@@ -1634,11 +1778,12 @@ function Get-OrphanATLinks {
                 if ($trusteeMissing) { $reason += 'Missing trustee SID (edsaTrusteeSID)' }
 
                 $result.List += [PSCustomObject]@{
-                    dn     = ConvertTo-SafeHtml $link.distinguishedName
+                    dn     = ConvertTo-SafeHtml $link.Properties["distinguishedname"][0]
                     reason = ConvertTo-SafeHtml ($reason -join '; ')
                 }
             }
         }
+        if ($links) { $links.Dispose() }
 
         $result.Count = $result.List.Count
         Write-Log "Found $($result.Count) orphan Access Template Link(s)."
@@ -2129,6 +2274,7 @@ function New-HtmlReport {
         [int]$ScriptPoliciesCount,
         [PSCustomObject]$PolicyObjects,
         [PSCustomObject]$OrphanPolicyLinks,
+        [PSCustomObject]$OverlappingPolicyLinks,
         [PSCustomObject]$AccessTemplates,
         [PSCustomObject]$OrphanATLinks,
         [PSCustomObject]$AzureTenants,
@@ -2155,6 +2301,19 @@ function New-HtmlReport {
     } else { "Unknown" }
 
     $arProductDisplay = $ARVersion.InstalledProduct
+
+    # -- Parallel Handling (Dynamic Groups): AR 8.2.1 SP6 (build 8.2.1.149) or later ----
+    # The KPI and card are only rendered when the detected version qualifies AND Dynamic Groups exist.
+    $parallelMinVersion = [version]'8.2.1.149'
+    $parallelVersionOk  = $false
+    foreach ($candidate in @($ARVersion.InstalledVersion, $ARVersion.ServiceVersion)) {
+        if ($candidate -and ([string]$candidate -match '(\d+(\.\d+){1,3})')) {
+            try {
+                if ([version]$matches[1] -ge $parallelMinVersion) { $parallelVersionOk = $true; break }
+            } catch { }
+        }
+    }
+    $showParallelHandling = $parallelVersionOk -and ($DynamicGroups.TotalCount -gt 0)
 
     # -- Domain table rows (with latency) -------------------------------------
     $domainRows = ""
@@ -2395,16 +2554,13 @@ function New-HtmlReport {
     $userCountChartData = if ($ManagedUserCounts.PerDomain -and $ManagedUserCounts.PerDomain.Count -gt 0) {
         ConvertTo-Json @($ManagedUserCounts.PerDomain | Where-Object { $_.count -ge 0 } |
             Select-Object @{N='name';E={$_.name}},
-                          @{N='enabled';E={[math]::Max(0, $_.count - $_.disabled)}},
-                          @{N='disabled';E={$_.disabled}}) -Compress
+                          @{N='enabled';E={$_.count}}) -Compress
     } else { '[]' }
     $safeTotalUsers    = [math]::Max(0, $ManagedUserCounts.TotalCount)
     $safeHybridTotal   = [math]::Max(0, $ManagedUserCounts.HybridTotal)
     $safeGmsaTotal     = [math]::Max(0, $ManagedUserCounts.GmsaTotal)
     $safeExcludedTotal = [math]::Max(0, $ManagedUserCounts.ExcludedTotal)
-    $safeDisabledTotal = [math]::Max(0, $ManagedUserCounts.DisabledTotal)
     $safeOnPremTotal = [math]::Max(0, $safeTotalUsers - $safeHybridTotal)
-    $safeEnabledTotal = [math]::Max(0, $safeTotalUsers - $safeDisabledTotal)
 
     # Cloud-only = Azure Users (all tenants) - Hybrid accounts
     $azureUsersTotal = 0
@@ -2449,6 +2605,12 @@ function New-HtmlReport {
     # -- Orphan Policy Links data for table ----------------------------------
     $orphanPoJsonData = if ($OrphanPolicyLinks.List -and $OrphanPolicyLinks.List.Count -gt 0) {
         ConvertTo-Json @($OrphanPolicyLinks.List) -Compress
+    } else { '[]' }
+
+    # -- Overlapping Policy Links data for table -----------------------------
+    $safeOverlap = [math]::Max(0, $OverlappingPolicyLinks.Count)
+    $overlapJsonData = if ($OverlappingPolicyLinks.List -and $OverlappingPolicyLinks.List.Count -gt 0) {
+        ConvertTo-Json @($OverlappingPolicyLinks.List) -Compress
     } else { '[]' }
 
     # -- Access Templates data for table and chart --------------------------
@@ -2565,6 +2727,7 @@ body{font-family:'Noto Sans',Verdana,'Segoe UI',system-ui,sans-serif;background:
 table{width:100%;border-collapse:collapse;font-size:.82rem}
 thead th{text-align:left;padding:9px 12px;background:#f4f7f8;font-weight:600;color:#40535d;border-bottom:2px solid #dce3e5;white-space:nowrap}
 tbody td{padding:8px 12px;border-bottom:1px solid #eef2f3;vertical-align:top}
+tfoot td{padding:8px 12px;vertical-align:top}
 tbody tr:last-child td{border-bottom:none}
 tbody tr:hover{background:#f5f8f9}
 .dn-cell{font-size:.75rem;color:#5d7079;word-break:break-all}
@@ -2681,6 +2844,13 @@ $(if ($verboseLoggingCount -gt 0) {@"
     <div class="val">$(Format-Count $DynamicGroups.TotalCount)</div>
     <div class="sub"><span class="badge $dgBrokenBadge">$($DynamicGroups.BrokenCount) broken</span></div>
   </div>
+$(if ($showParallelHandling) {@"
+  <div class="kpi teal" data-section="sec-parallel" onclick="document.getElementById(this.dataset.section).scrollIntoView({behavior:'smooth'})">
+    <div class="lbl">Parallel Handling</div>
+    <div class="val" style="font-size:1.1rem;padding-top:4px">Available</div>
+    <div class="sub"><span class="badge badge-amber">Review settings</span></div>
+  </div>
+"@})
   <div class="kpi purple" data-section="sec-mu" onclick="document.getElementById(this.dataset.section).scrollIntoView({behavior:'smooth'})">
     <div class="lbl">Managed Units</div>
     <div class="val">$(Format-Count $ManagedUnits.TotalCount)</div>
@@ -2705,6 +2875,11 @@ $(if ($verboseLoggingCount -gt 0) {@"
     <div class="lbl">Policy Objects</div>
     <div class="val">$(Format-Count $PolicyObjects.TotalCount)</div>
     <div class="sub"><span class="badge badge-green">$($PolicyObjects.EnabledCount) enabled</span> <span class="badge badge-red">$($PolicyObjects.DisabledCount) disabled</span></div>
+  </div>
+  <div class="kpi $(if ($safeOverlap -gt 0) {'amber'} else {'green'})" data-section="sec-overlap" onclick="document.getElementById(this.dataset.section).scrollIntoView({behavior:'smooth'})">
+    <div class="lbl">Overlapping AP Links</div>
+    <div class="val">$(Format-Count $safeOverlap)</div>
+    <div class="sub">redundant policy links</div>
   </div>
   <div class="kpi pink" data-section="sec-at" onclick="document.getElementById(this.dataset.section).scrollIntoView({behavior:'smooth'})">
     <div class="lbl">Access Templates</div>
@@ -2760,7 +2935,7 @@ $(if ($ManagedUserCounts.Skipped) {@"
 <div class="panel" style="margin-top:20px">
   <h2>Managed Users &nbsp;<span class="badge badge-blue">$(Format-Count $safeTotalUsers) total</span></h2>
   <p style="font-size:.82rem;color:#5d7079;margin-bottom:14px">
-    User count per domain, excluding OUs and Managed Units linked to <em>Built-in Policy &ndash; Exclude from Managed Scope</em>$(
+    Active (enabled) user count per domain, excluding OUs and Managed Units linked to <em>Built-in Policy &ndash; Exclude from Managed Scope</em>$(
         $exParts = @()
         if ($ManagedUserCounts.ExcludedOUs.Count -gt 0) { $exParts += "$($ManagedUserCounts.ExcludedOUs.Count) OU(s)" }
         if ($ManagedUserCounts.ExcludedMUs.Count -gt 0) { $exParts += "$($ManagedUserCounts.ExcludedMUs.Count) MU(s)" }
@@ -2773,17 +2948,16 @@ $(if ($ManagedUserCounts.Skipped) {@"
   <h2>Users per Domain</h2>
   <div style="overflow-x:auto">
   <table>
-    <thead><tr><th>Domain</th><th style="text-align:right">Total Users</th><th style="text-align:right">Disabled</th><th style="text-align:right">On-Prem Only</th><th style="text-align:right">Hybrid</th><th style="text-align:right">gMSA</th><th style="text-align:right">Excluded OUs Users</th></tr></thead>
+    <thead><tr><th>Domain</th><th style="text-align:right">Accounts</th><th style="text-align:right">On-Prem Only</th><th style="text-align:right">Hybrid</th><th style="text-align:right">gMSA</th><th style="text-align:right">Excluded OUs Users</th></tr></thead>
     <tbody>
 $(($ManagedUserCounts.PerDomain | ForEach-Object {
     $countDisplay    = if ($_.count -ge 0)  { Format-Count $_.count }  else { '<span class="muted">Error</span>' }
     $onpremDisplay   = if ($_.onprem -ge 0) { Format-Count $_.onprem } else { '<span class="muted">Error</span>' }
-    $disabledDisplay = if ($_.count -ge 0)  { Format-Count $_.disabled } else { '<span class="muted">Error</span>' }
-    "      <tr><td>$($_.name)</td><td style='text-align:right;font-weight:600'>$countDisplay</td><td style='text-align:right'>$disabledDisplay</td><td style='text-align:right'>$onpremDisplay</td><td style='text-align:right'>$(Format-Count $_.hybrid)</td><td style='text-align:right'>$(Format-Count $_.gmsa)</td><td style='text-align:right'>$(Format-Count $_.excluded)</td></tr>"
+    "      <tr><td>$($_.name)</td><td style='text-align:right;font-weight:600'>$countDisplay</td><td style='text-align:right'>$onpremDisplay</td><td style='text-align:right'>$(Format-Count $_.hybrid)</td><td style='text-align:right'>$(Format-Count $_.gmsa)</td><td style='text-align:right'>$(Format-Count $_.excluded)</td></tr>"
 }) -join "`n")
     </tbody>
     <tfoot>
-      <tr style="border-top:2px solid #dce3e5;font-weight:700"><td>Subtotal (AD)</td><td style="text-align:right">$(Format-Count $safeTotalUsers)</td><td style="text-align:right">$(Format-Count $safeDisabledTotal)</td><td style="text-align:right">$(Format-Count $safeOnPremTotal)</td><td style="text-align:right">$(Format-Count $safeHybridTotal)</td><td style="text-align:right">$(Format-Count $safeGmsaTotal)</td><td style="text-align:right">$(Format-Count $safeExcludedTotal)</td></tr>
+      <tr style="border-top:2px solid #dce3e5;font-weight:700"><td>Total</td><td style="text-align:right">$(Format-Count $safeTotalUsers)</td><td style="text-align:right">$(Format-Count $safeOnPremTotal)</td><td style="text-align:right">$(Format-Count $safeHybridTotal)</td><td style="text-align:right">$(Format-Count $safeGmsaTotal)</td><td style="text-align:right">$(Format-Count $safeExcludedTotal)</td></tr>
     </tfoot>
   </table>
   </div>
@@ -2860,7 +3034,7 @@ $(if (-not $perfFlagOk) {@"
     </p>
     <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
       This registry key is required for optimal Active Roles performance when Exchange is present.
-      Please refer to KB article <a href="https://support.oneidentity.com/kb/4336544/" target="_blank" rel="noopener" style="color:#026d92;font-weight:600">KB 4336544</a> for configuration instructions.
+      Please refer to KB article <a href="https://old-support.oneidentity.com/kb/4336544/" target="_blank" rel="noopener" style="color:#026d92;font-weight:600">KB 4336544</a> for configuration instructions.
     </p>
   </div>
 "@})
@@ -2893,7 +3067,7 @@ $(if ($disable500VA) {@"
     </p>
     <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
       This registry key should be configured for proper Active Roles operation.
-      Please refer to KB article <a href="https://support.oneidentity.com/kb/4216183" target="_blank" rel="noopener" style="color:#026d92;font-weight:600">KB 4216183</a> for details and configuration instructions.
+      Please refer to KB article <a href="https://old-support.oneidentity.com/kb/4216183" target="_blank" rel="noopener" style="color:#026d92;font-weight:600">KB 4216183</a> for details and configuration instructions.
     </p>
   </div>
 </div>
@@ -2955,7 +3129,7 @@ $(if ($autoShrinkChecked) {
       To disable, run: <code style="background:#fff;padding:2px 6px;border-radius:4px">ALTER DATABASE [$($AutoShrinkInfo.DatabaseName)] SET AUTO_SHRINK OFF</code>
     </p>
     <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
-      See <a href="https://support.oneidentity.com/kb/4381874" target="_blank" rel="noopener" style="color:#0079a1">KB 4381874</a> for details and additional guidance.
+      See <a href="https://old-support.oneidentity.com/kb/4381874" target="_blank" rel="noopener" style="color:#0079a1">KB 4381874</a> for details and additional guidance.
     </p>
   </div>
 </div>
@@ -3012,7 +3186,7 @@ $(if ($alwaysOnChecked) {
       <code style="background:#fff;padding:2px 6px;border-radius:4px">Get-ARService -IncludeAdvancedDatabaseSettings | fl MultiSubnetFailoverSupport</code>
     </p>
     <p style="margin-top:8px;color:#8c4a23;font-size:0.9rem">
-      See <a href="https://support.oneidentity.com/kb/4374079" target="_blank" rel="noopener" style="color:#0079a1">KB 4374079</a> for instructions on enabling MultiSubnetFailoverSupport.
+      See <a href="https://old-support.oneidentity.com/kb/4374079" target="_blank" rel="noopener" style="color:#0079a1">KB 4374079</a> for instructions on enabling MultiSubnetFailoverSupport.
     </p>
   </div>
 </div>
@@ -3030,7 +3204,7 @@ $(if ($alwaysOnChecked) {
       <code style="background:#fff;padding:2px 6px;border-radius:4px">Get-ARService -IncludeAdvancedDatabaseSettings | fl MultiSubnetFailoverSupport</code>
     </p>
     <p style="margin-top:8px;color:#40535d;font-size:0.9rem">
-      See <a href="https://support.oneidentity.com/kb/4374079" target="_blank" rel="noopener" style="color:#0079a1">KB 4374079</a> for details.
+      See <a href="https://old-support.oneidentity.com/kb/4374079" target="_blank" rel="noopener" style="color:#0079a1">KB 4374079</a> for details.
     </p>
   </div>
 </div>
@@ -3108,7 +3282,7 @@ $(if ($actionRequired) {@"
     </p>
     <p style="margin-top:8px;color:#93300c;font-size:0.9rem">
       For <strong>Max Degree of Parallelism (MaxDOP)</strong> there is no single recommended value: run the SQL
-      script attached to <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#0079a1">KB 4383609</a>
+      script attached to <a href="https://old-support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#0079a1">KB 4383609</a>
       against this instance and set MaxDOP based on the value returned by the script.
     </p>
 $(if ($maxStatus -eq 'ActionRequired' -and $maxRunning -eq 0) {
@@ -3137,7 +3311,7 @@ $(if ($maxStatus -eq 'ActionRequired' -and $maxRunning -eq 0) {
       should be validated against the broader SQL workload on this instance.
     </p>
     <p style="margin-top:8px;color:#93300c;font-size:0.9rem">
-      See <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#0079a1">KB 4383609</a> &mdash; Recommended SQL settings for Active Roles performance.
+      See <a href="https://old-support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#0079a1">KB 4383609</a> &mdash; Recommended SQL settings for Active Roles performance.
     </p>
   </div>
 "@} else {@"
@@ -3147,7 +3321,7 @@ $(if ($maxStatus -eq 'ActionRequired' -and $maxRunning -eq 0) {
       Cost Threshold for Parallelism meets the recommended baseline and the current MaxDOP running value is
       <strong>$maxRunning</strong>. However, this report cannot determine whether this is the correct value
       for this server's hardware: run the SQL script attached to
-      <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#0079a1">KB 4383609</a>
+      <a href="https://old-support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#0079a1">KB 4383609</a>
       against this instance and confirm that MaxDOP matches the value returned by the script.
     </p>
 $(if ($null -ne $sqlMajor -and $sqlMajor -ge 15) {@"
@@ -3169,7 +3343,7 @@ $(if ($null -ne $sqlMajor -and $sqlMajor -ge 15) {@"
       Could not verify SQL parallelism settings.$(if ($SqlParallelismInfo.Error) { " Error: $($SqlParallelismInfo.Error)" } else { " The Configuration DB could not be discovered or connected to." })
     </p>
     <p style="margin-top:8px;color:#40535d;font-size:0.9rem">
-      See <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#0079a1">KB 4383609</a> &mdash; Recommended SQL settings for Active Roles performance.
+      See <a href="https://old-support.oneidentity.com/kb/4383609" target="_blank" rel="noopener" style="color:#0079a1">KB 4383609</a> &mdash; Recommended SQL settings for Active Roles performance.
     </p>
   </div>
 </div>
@@ -3208,6 +3382,30 @@ $(if ($null -ne $sqlMajor -and $sqlMajor -ge 15) {@"
   </p>
   $dgExpensiveSection
 </div>
+$(if ($showParallelHandling) {@"
+<div class="panel panel-full" id="sec-parallel" style="margin-top:20px;scroll-margin-top:16px;border-left:4px solid #d97706">
+  <h2>Parallel Handling &nbsp;<span class="badge badge-blue">AR 8.2.1 SP6 (8.2.1.149)+</span> &nbsp;<span class="badge badge-amber">Review settings</span></h2>
+  <p style="font-size:.85rem;color:#5d7079;margin-bottom:12px">
+    Detected Active Roles version <strong>$arVersionDisplay</strong> supports <strong>Parallel Handling</strong>, which allows multiple Dynamic Groups to be processed in parallel,
+    and this environment has <strong>$(Format-Count $DynamicGroups.TotalCount) Dynamic Group(s)</strong>.
+    The number of threads used to process Dynamic Group changes is controlled by the registry value <code>DynamicGroupParallelHandlingNumber</code>
+    on each Administration Service instance. Just as the SQL <code>MaxDOP</code> setting should be reviewed for the workload, this value should be reviewed
+    and adjusted to match the number and cost of your Dynamic Groups and the capacity of your Domain Controllers.
+  </p>
+  <p style="font-family:monospace;font-size:.85rem;color:#40535d;margin-bottom:12px;padding-left:12px">HKEY_LOCAL_MACHINE\SOFTWARE\One Identity\Active Roles\Configuration\Service\DynamicGroupParallelHandlingNumber</p>
+  <ul style="font-size:.85rem;color:#5d7079;margin:0 0 12px 22px;line-height:1.6">
+    <li>Allowed range: <strong>2&ndash;8</strong>. Default: <strong>2</strong>. One Identity <strong>recommends 3</strong> as a good balance between performance and resource usage.</li>
+    <li>The threads are shared between automatic rebuilds (service start, Dynamic Group Updater task), which use at most <em>value &minus; 1</em> threads, and manual rebuilds, which always keep at least 1 thread reserved and take priority.</li>
+    <li>Lower values may slow down processing. Very high values can overload the Domain Controller (Event IDs 2000/2530 in the Administration Service log and 2899 on the DC); in that case lower the value or increase the maximum result set size of the DC LDAP policy.</li>
+    <li>Restart the Active Roles Administration Service to apply the change. The value can differ per Administration Service instance.</li>
+  </ul>
+  <p style="font-size:.85rem;color:#5d7079;margin-bottom:0">
+    <strong>Recommendation:</strong> Review the current value on each Administration Service instance that manages Dynamic Groups. See
+    <a href="https://old-support.oneidentity.com/kb/4382821" target="_blank" rel="noopener" style="color:#0079a1">KB 4382821</a> and the
+    <a href="https://docs.oneidentity.com/bundle/active-roles_administration-guide_8.7/page/guides/administrationguide/dynamic-groups-parallel-threads.htm" target="_blank" rel="noopener" style="color:#0079a1">Administration Guide</a> for details.
+  </p>
+</div>
+"@})
 
 <!-- =========================== 05 MANAGED UNITS ======================== -->
 <div class="sec-title" id="sec-mu"><span class="sec-icon">05</span>Managed Units</div>
@@ -3330,8 +3528,8 @@ $(if ($safeOrphan -gt 0) {@"
     These policy links reference a missing target object or a missing policy object.
     This can occur when objects are deleted without cleaning up their policy links.
     <br><strong>Recommendation:</strong> Review and remove orphan links using PowerShell.
-    See <a href="https://support.oneidentity.com/kb/4338749" target="_blank" rel="noopener" style="color:#0079a1">KB 4338749</a> for removal instructions
-    and <a href="https://support.oneidentity.com/kb/4381874" target="_blank" rel="noopener" style="color:#0079a1">KB 4381874</a> for additional guidance.
+    See <a href="https://old-support.oneidentity.com/kb/4338749" target="_blank" rel="noopener" style="color:#0079a1">KB 4338749</a> for removal instructions
+    and <a href="https://old-support.oneidentity.com/kb/4381874" target="_blank" rel="noopener" style="color:#0079a1">KB 4381874</a> for additional guidance.
   </p>
   <div style="display:flex;justify-content:flex-end;margin-bottom:12px">
     <button class="btn" onclick="exportOrphanPoCSV()">Export CSV</button>
@@ -3340,6 +3538,37 @@ $(if ($safeOrphan -gt 0) {@"
     <table id="orphanPoTable"><thead><tr id="orphanPoTableHead"></tr></thead><tbody id="orphanPoTableBody"></tbody></table>
   </div>
   <div class="pagination"><span id="orphanPoPageInfo"></span><div class="pagination-btns" id="orphanPoPagBtns"></div></div>
+</div>
+"@})
+
+<!-- =========================== 7.1 OVERLAPPING AP LINKS ================ -->
+<div class="sec-title" id="sec-overlap"><span class="sec-icon">7.1</span>Overlapping AP Links</div>
+$(if ($safeOverlap -gt 0) {@"
+<div class="panel" style="margin-bottom:24px;border-left:4px solid #d97706">
+  <h2 style="color:#d97706">Overlapping Policy Object Links &nbsp;<span class="badge badge-amber">$safeOverlap found</span></h2>
+  <p style="font-size:.85rem;color:#5d7079;margin-bottom:12px">
+    The same policy is linked to a container and again to one of its child containers.
+    Objects under the child container receive the policy twice, so the child link is redundant.
+  </p>
+  <p style="font-size:.85rem;color:#5d7079;margin-bottom:6px"><strong>Performance impact:</strong> overlapping policy links can cause unnecessary overhead.</p>
+  <ul style="font-size:.85rem;color:#5d7079;margin:0 0 12px 22px;line-height:1.6">
+    <li>The Administration Service evaluates and applies the same policy more than once for every request against objects under the child container (for example create, modify and move operations).</li>
+    <li>This adds processing time and can slow down these operations, especially for policies that run scripts or workflows, or for containers with many objects.</li>
+  </ul>
+  <p style="font-size:.85rem;color:#5d7079;margin-bottom:16px">
+    <strong>Recommendation:</strong> Review each child link (use the <em>Child Link DN</em> column to locate it in Active Roles) and remove it unless it carries an intentional per-link override.
+  </p>
+  <div style="display:flex;justify-content:flex-end;margin-bottom:12px">
+    <button class="btn" onclick="exportOverlapCSV()">Export CSV</button>
+  </div>
+  <div style="overflow-x:auto">
+    <table id="overlapTable"><thead><tr id="overlapTableHead"></tr></thead><tbody id="overlapTableBody"></tbody></table>
+  </div>
+  <div class="pagination"><span id="overlapPageInfo"></span><div class="pagination-btns" id="overlapPagBtns"></div></div>
+</div>
+"@} else {@"
+<div class="panel" style="margin-bottom:24px">
+  <p class="ok-note">&#10003; No overlapping policy links detected.</p>
 </div>
 "@})
 
@@ -3386,8 +3615,8 @@ $(if ($safeOrphanAt -gt 0) {@"
     These Access Template links reference a missing target object or a missing trustee SID.
     This can occur when objects or security principals are deleted without cleaning up their AT links.
     <br><strong>Recommendation:</strong> Review and remove orphan links using PowerShell.
-    See <a href="https://support.oneidentity.com/kb/4338749" target="_blank" rel="noopener" style="color:#0079a1">KB 4338749</a> for removal instructions
-    and <a href="https://support.oneidentity.com/kb/4381874" target="_blank" rel="noopener" style="color:#0079a1">KB 4381874</a> for additional guidance.
+    See <a href="https://old-support.oneidentity.com/kb/4338749" target="_blank" rel="noopener" style="color:#0079a1">KB 4338749</a> for removal instructions
+    and <a href="https://old-support.oneidentity.com/kb/4381874" target="_blank" rel="noopener" style="color:#0079a1">KB 4381874</a> for additional guidance.
   </p>
   <div style="display:flex;justify-content:flex-end;margin-bottom:12px">
     <button class="btn" onclick="exportOrphanAtCSV()">Export CSV</button>
@@ -3450,11 +3679,11 @@ $(if ($safeOrphanAt -gt 0) {@"
       official One Identity Knowledge Base articles:
     </p>
     <p style="margin:12px 0 0 0">
-      <a href="https://support.oneidentity.com/kb/4340870" target="_blank" rel="noopener noreferrer"
+      <a href="https://old-support.oneidentity.com/kb/4340870" target="_blank" rel="noopener noreferrer"
          style="display:inline-block;padding:10px 16px;background:#04aada;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;margin-right:8px;margin-bottom:8px">
         One Identity KB 4340870 &mdash; Active Roles Known Issues &rarr;
       </a>
-      <a href="https://support.oneidentity.com/kb/4383609" target="_blank" rel="noopener noreferrer"
+      <a href="https://old-support.oneidentity.com/kb/4383609" target="_blank" rel="noopener noreferrer"
          style="display:inline-block;padding:10px 16px;background:#04aada;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;margin-bottom:8px">
         One Identity KB 4383609 &mdash; Recommended SQL settings for Active Roles performance &rarr;
       </a>
@@ -3520,7 +3749,7 @@ const doughnutOpts = {
   cutout: '62%'
 };
 
-// Managed Users per Domain chart (stacked: Enabled + Disabled)
+// Managed Users per Domain chart (active users only)
 const UC_DATA = $userCountChartData;
 if (UC_DATA && UC_DATA.length > 0) {
   new Chart(document.getElementById('userCountChart'), {
@@ -3529,16 +3758,9 @@ if (UC_DATA && UC_DATA.length > 0) {
       labels: UC_DATA.map(d => d.name || 'N/A'),
       datasets: [
         {
-          label: 'Enabled',
+          label: 'Active users',
           data: UC_DATA.map(d => d.enabled || 0),
           backgroundColor: '#77c8b3',
-          borderRadius: 6,
-          maxBarThickness: 60
-        },
-        {
-          label: 'Disabled',
-          data: UC_DATA.map(d => d.disabled || 0),
-          backgroundColor: '#fb4f14',
           borderRadius: 6,
           maxBarThickness: 60
         }
@@ -3548,12 +3770,12 @@ if (UC_DATA && UC_DATA.length > 0) {
       responsive: true,
       maintainAspectRatio: false,
       plugins: {
-        legend: { display: true, position: 'bottom', labels: { boxWidth: 14, padding: 16 } },
+        legend: { display: false },
         tooltip: { mode: 'index', intersect: false }
       },
       scales: {
-        x: { stacked: true, grid: { display: false } },
-        y: { stacked: true, beginAtZero: true, ticks: { precision: 0 }, grid: { color: '#eef2f3' } }
+        x: { grid: { display: false } },
+        y: { beginAtZero: true, ticks: { precision: 0 }, grid: { color: '#eef2f3' } }
       }
     }
   });
@@ -3616,6 +3838,18 @@ function sortOrphanPoTable(i){const k=ORPHAN_PO_COLUMNS[i].key;if(orphanPoS.sort
 function goOrphanPoPage(p){const tp=Math.ceil(orphanPoS.filtered.length/orphanPoS.pageSize);if(p<1||p>tp)return;orphanPoS.page=p;renderOrphanPoTableBody()}
 function exportOrphanPoCSV(){const h=ORPHAN_PO_COLUMNS.map(c=>c.label).join(',');const rows=orphanPoS.filtered.map(r=>ORPHAN_PO_COLUMNS.map(c=>'"'+(r[c.key]??'').toString().replace(/"/g,'""')+'"').join(','));const csv='\uFEFF'+h+'\n'+rows.join('\n');const b=new Blob([csv],{type:'text/csv;charset=utf-8;'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='orphan_policy_links_'+new Date().toISOString().slice(0,10)+'.csv';a.click()}
 if(ORPHAN_PO_DATA&&ORPHAN_PO_DATA.length>0){orphanPoS.data=ORPHAN_PO_DATA;orphanPoS.filtered=[...orphanPoS.data];renderOrphanPoTableHead();renderOrphanPoTableBody()}
+
+// Overlapping Policy Links interactive table
+const OVERLAP_DATA = $overlapJsonData;
+const OVERLAP_COLUMNS = [{key:'policy',label:'Policy'},{key:'parent',label:'Parent Link Target'},{key:'child',label:'Child Link Target (redundant)'},{key:'childLinkDN',label:'Child Link DN'}];
+let overlapS = {data:[],filtered:[],page:1,pageSize:10,sortCol:null,sortAsc:true};
+function renderOverlapTableHead(){const el=document.getElementById('overlapTableHead');if(!el)return;el.innerHTML=OVERLAP_COLUMNS.map((c,i)=>'<th onclick="sortOverlapTable('+i+')" data-col="'+i+'">'+c.label+' <span class="sort-icon">&#9650;</span></th>').join('')}
+function renderOverlapTableBody(){const el=document.getElementById('overlapTableBody');if(!el)return;const ps=overlapS.pageSize;const s=(overlapS.page-1)*ps;const p=overlapS.filtered.slice(s,s+ps);el.innerHTML=p.map(r=>'<tr>'+OVERLAP_COLUMNS.map(c=>'<td style="word-break:break-all">'+(r[c.key]??'')+'</td>').join('')+'</tr>').join('');renderOverlapPag()}
+function renderOverlapPag(){const el=document.getElementById('overlapPageInfo');if(!el)return;const ps=overlapS.pageSize;const t=overlapS.filtered.length;const tp=Math.ceil(t/ps);const s=(overlapS.page-1)*ps+1;const e=Math.min(overlapS.page*ps,t);el.textContent=t>0?s+'-'+e+' of '+t:'No results';const b=document.getElementById('overlapPagBtns');if(tp<=1){b.innerHTML='';return}let h='<button onclick="goOverlapPage('+(overlapS.page-1)+')"'+(overlapS.page===1?' disabled':'')+'>&laquo;</button>';for(let pg=Math.max(1,overlapS.page-2);pg<=Math.min(tp,overlapS.page+2);pg++)h+='<button class="'+(pg===overlapS.page?'active':'')+'" onclick="goOverlapPage('+pg+')">'+pg+'</button>';h+='<button onclick="goOverlapPage('+(overlapS.page+1)+')"'+(overlapS.page===tp?' disabled':'')+'>&raquo;</button>';b.innerHTML=h}
+function sortOverlapTable(i){const k=OVERLAP_COLUMNS[i].key;if(overlapS.sortCol===i)overlapS.sortAsc=!overlapS.sortAsc;else{overlapS.sortCol=i;overlapS.sortAsc=true}overlapS.filtered.sort((a,b)=>{let va=(a[k]??'').toString().toLowerCase(),vb=(b[k]??'').toString().toLowerCase();return overlapS.sortAsc?va.localeCompare(vb):vb.localeCompare(va)});document.querySelectorAll('#overlapTableHead th').forEach((th,j)=>{th.classList.toggle('sorted',j===i);th.querySelector('.sort-icon').innerHTML=(j===i&&!overlapS.sortAsc)?'&#9660;':'&#9650;'});overlapS.page=1;renderOverlapTableBody()}
+function goOverlapPage(p){const tp=Math.ceil(overlapS.filtered.length/overlapS.pageSize);if(p<1||p>tp)return;overlapS.page=p;renderOverlapTableBody()}
+function exportOverlapCSV(){const h=OVERLAP_COLUMNS.map(c=>c.label).join(',');const rows=overlapS.filtered.map(r=>OVERLAP_COLUMNS.map(c=>'"'+(r[c.key]??'').toString().replace(/"/g,'""')+'"').join(','));const csv='﻿'+h+'\n'+rows.join('\n');const b=new Blob([csv],{type:'text/csv;charset=utf-8;'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='overlapping_policy_links_'+new Date().toISOString().slice(0,10)+'.csv';a.click()}
+if(OVERLAP_DATA&&OVERLAP_DATA.length>0){overlapS.data=OVERLAP_DATA;overlapS.filtered=[...overlapS.data];renderOverlapTableHead();renderOverlapTableBody()}
 
 // Access Templates chart and interactive table
 const AT_DATA = $atJsonData;
@@ -3707,7 +3941,6 @@ try {
             HybridTotal   = 0
             GmsaTotal     = 0
             ExcludedTotal = 0
-            DisabledTotal = 0
             PerDomain     = @()
             ExcludedOUs   = @()
             ExcludedMUs   = @()
@@ -3741,6 +3974,9 @@ try {
 
     Write-Log "Collecting orphan policy links..."
     $orphanPoLinks = Get-OrphanPolicyLinks
+
+    Write-Log "Collecting overlapping policy links..."
+    $overlapPoLinks = Get-OverlappingPolicyLinks
 
     Write-Log "Collecting access templates info..."
     $accessTmpls = Get-AccessTemplatesInfo
@@ -3798,6 +4034,7 @@ try {
         -ScriptPoliciesCount $scriptPols `
         -PolicyObjects       $policyObjs `
         -OrphanPolicyLinks   $orphanPoLinks `
+        -OverlappingPolicyLinks $overlapPoLinks `
         -AccessTemplates      $accessTmpls `
         -OrphanATLinks       $orphanAtLinks `
         -AzureTenants        $azureTenants `
