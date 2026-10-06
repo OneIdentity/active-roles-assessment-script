@@ -41,10 +41,6 @@ The **Users per Domain** table counts **active (enabled) accounts only** — dis
 
 Configuration data (version, managed domains, servers, replication partners, Managed Units, workflows, virtual attributes, script modules, policy objects and links, Access Template links, Access Templates, Microsoft Entra tenants and the overlapping AP Links analysis) is collected through the Active Roles **EDMS provider** (`Invoke-EDMSSearch` / `Get-EDMSObjects`), which is significantly faster than the Management Shell cmdlets. Only the Dynamic Groups collection still uses `Get-QADGroup -Dynamic`.
 
-### Knowledge Base links
-
-KB links in the report and in this document point to `old-support.oneidentity.com`, the temporary location of the One Identity Knowledge Base until the final solution is available.
-
 ---
 
 ## Requirements
