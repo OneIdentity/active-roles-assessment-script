@@ -31,6 +31,12 @@ A PowerShell script that connects to a One Identity Active Roles installation, c
 
 The output is a single self-contained `.html` file with KPI cards, charts, and searchable/sortable tables. Chart.js is loaded from CDN.
 
+### License count video
+
+Interested in the **license count** side of the report? A recorded walkthrough shows how to run the script with a focus on license counting: [Watch the video](https://share.articulate.com/JudvdrAZd4a3OJLhHtTao).
+
+The **Users per Domain** table counts **active (enabled) accounts only** — disabled accounts are excluded from every figure — which is the number to use as a reference when reviewing license usage.
+
 ### Data collection and performance
 
 Configuration data (version, managed domains, servers, replication partners, Managed Units, workflows, virtual attributes, script modules, policy objects and links, Access Template links, Access Templates, Microsoft Entra tenants and the overlapping AP Links analysis) is collected through the Active Roles **EDMS provider** (`Invoke-EDMSSearch` / `Get-EDMSObjects`), which is significantly faster than the Management Shell cmdlets. Only the Dynamic Groups collection still uses `Get-QADGroup -Dynamic`.
